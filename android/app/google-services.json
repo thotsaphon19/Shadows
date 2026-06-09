@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "646355477573",
+    "project_id": "shadows-by-yannawut",
+    "storage_bucket": "shadows-by-yannawut.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:646355477573:android:22f16fa2673c558e236f2c",
+        "android_client_info": {
+          "package_name": "com.yannawut.shadows"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "646355477573-4ffgmf72075r3eretl6mjsube9ikqa6e.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.yannawut.shadows",
+            "certificate_hash": "1c2945aaa9d2468e26838fff2aa0854c91e31ac8"
+          }
+        },
+        {
+          "client_id": "646355477573-cp972f1njj369sa63j66rtjk44a41p6t.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyATeU3Mi6vE45wq0yqRmKHYKPir0htu9VE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "646355477573-cp972f1njj369sa63j66rtjk44a41p6t.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

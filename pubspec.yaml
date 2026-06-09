@@ -1,0 +1,67 @@
+name: shadows_by_yannawut
+description: Language Learning App - Shadow Reading Technique
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Firebase
+  firebase_core: ^3.6.0
+  firebase_auth: ^5.3.0
+  cloud_firestore: ^5.4.0
+  firebase_storage: ^12.3.0
+  cloud_functions: ^5.1.0
+
+  # Auth
+  google_sign_in: ^6.2.1
+
+  # Audio
+  audioplayers: ^6.1.0
+  video_player: ^2.9.2
+
+  # File
+  path_provider: ^2.1.4
+
+  # Permission
+  permission_handler: ^11.3.1
+
+  # Share
+  share_plus: ^10.0.0
+
+  # In-App Purchase
+  purchases_flutter: ^8.0.0
+
+  # UI
+  google_fonts: ^6.2.1
+  cached_network_image: ^3.4.1
+
+  # Utils
+  shared_preferences: ^2.3.2
+  intl: ^0.19.0
+  http: ^1.2.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
+    - assets/icons/
+  fonts:
+    - family: NotoSans
+      fonts:
+        - asset: assets/fonts/NotoSans-Regular.ttf
+        - asset: assets/fonts/NotoSans-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/NotoSans-Bold.ttf
+          weight: 700
+        - asset: assets/fonts/NotoSans-ExtraBold.ttf
+          weight: 800
