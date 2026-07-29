@@ -1,8 +1,11 @@
 // lib/pages/home_page.dart
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import '../theme/app_theme.dart';
+import '../services/app_image_service.dart';
+import '../services/cloudflare_r2_service.dart';
 import '../widgets/shared_widgets.dart';
 
 class HomePage extends StatefulWidget {
@@ -32,23 +35,57 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() { super.initState(); _load(); }
 
+  Future<void> _initServices() async {
+    // ล้าง image cache และโหลดใหม่จาก Firestore
+    await AppImageService.reload();
+    await R2Service.reload();
+    if (mounted) setState(() {});
+  }
+
+  StreamSubscription? _userSub;
+  StreamSubscription? _langSub;
+
+  @override void dispose() {
+    _userSub?.cancel();
+    _langSub?.cancel();
+    super.dispose();
+  }
+
   Future<void> _load() async {
     final uid = FirebaseAuth.instance.currentUser?.uid;
-    if (uid == null) { setState(() { _langs = _demoLangs; _loading = false; }); return; }
-    try {
-      final u = await FirebaseFirestore.instance.collection('users').doc(uid).get();
-      final ls = await FirebaseFirestore.instance
-          .collection('userLanguages').where('userId', isEqualTo: uid)
-          .orderBy('totalHours', descending: true).get();
+    if (uid == null) {
+      setState(() { _langs = _demoLangs; _loading = false; });
+      return;
+    }
+
+    // Real-time stream: user stats
+    _userSub?.cancel();
+    _userSub = FirebaseFirestore.instance
+        .collection('users').doc(uid)
+        .snapshots()
+        .listen((doc) {
+      if (!mounted) return;
+      setState(() => _user = doc.data());
+    });
+
+    // Real-time stream: language hours
+    _langSub?.cancel();
+    _langSub = FirebaseFirestore.instance
+        .collection('userLanguages')
+        .where('userId', isEqualTo: uid)
+        .orderBy('totalHours', descending: true)
+        .snapshots()
+        .listen((snap) {
       if (!mounted) return;
       setState(() {
-        _user = u.data();
-        _langs = ls.docs.isEmpty ? _demoLangs : ls.docs.map((d) => d.data()).toList();
+        _langs = snap.docs.isEmpty
+            ? _demoLangs
+            : snap.docs.map((d) => d.data()).toList();
         _loading = false;
       });
-    } catch (_) {
+    }, onError: (_) {
       if (mounted) setState(() { _langs = _demoLangs; _loading = false; });
-    }
+    });
   }
 
   String _fmt(dynamic v) {
@@ -73,7 +110,14 @@ class _HomePageState extends State<HomePage> {
               title: 'Your Languages',
               subtitle: 'Tap a language to view all learners and total practice hours.',
               actionText: 'See all',
-              onAction: () => Navigator.pushNamed(context, '/leaderboard'),
+              onAction: () => Navigator.pushNamed(
+                context, '/leaderboard',
+                arguments: {
+                  'languageId': _langs.isNotEmpty
+                    ? (_langs.first['languageId'] as String? ?? 'English')
+                    : 'English',
+                },
+              ),
             ),
             if (_loading)
               const Padding(padding: EdgeInsets.all(32),
@@ -97,7 +141,13 @@ class _HomePageState extends State<HomePage> {
         ? (_user!['dailyPracticeMinutes'] as num) / 60 : 1.2);
 
     return GestureDetector(
-      onTap: () => Navigator.pushNamed(context, '/lessons'),
+      onTap: () {
+        final firstLang = _langs.isNotEmpty
+            ? _langs.first['languageId'] as String? ?? 'English'
+            : 'English';
+        Navigator.pushNamed(context, '/tutors',
+            arguments: {'languageId': firstLang});
+      },
       child: Container(
         margin: const EdgeInsets.all(12),
         padding: const EdgeInsets.all(18),
@@ -123,10 +173,10 @@ class _HomePageState extends State<HomePage> {
             ]),
             const SizedBox(height: 8),
           ]),
-          Positioned(right: 0, top: -8, child: Image.asset(
-            'assets/images/mascot_headphones.png', width: 110,
-            errorBuilder: (_, __, ___) => const Icon(
-              Icons.headphones, size: 80, color: AppColors.primaryLight),
+          Positioned(right: 0, top: -8, child: AppImage(
+            imageKey: AppImageService.mascotMain,
+            width: 110,
+            placeholder: const Icon(Icons.headphones, size: 80, color: AppColors.primaryLight),
           )),
         ]),
       ),
@@ -140,15 +190,26 @@ class _HomePageState extends State<HomePage> {
     String weekly;
     if (l['lastActiveToday'] == true) {
       weekly = 'Last active today';
-    } else if (l['lastActive2days'] == true) weekly = 'Last active 2 days ago';
-    else weekly = 'This week ${(l['weeklyHours'] as num? ?? 0).toStringAsFixed(1)} h';
+    } else if (l['lastActive2days'] == true) {
+      weekly = 'Last active 2 days ago';
+    } else {
+      weekly = 'This week ${(l['weeklyHours'] as num? ?? 0).toStringAsFixed(1)} h';
+    }
 
     return LanguageCard(
       flag: flag, name: name,
       totalHours: hours, weeklyInfo: weekly,
       learners: l['learners'] as String? ?? '--',
-      onTap: () => Navigator.pushNamed(context, '/leaderboard',
-        arguments: {'languageId': name}),
+      // กด card → เลือกครู (flow หลัก)
+      onTap: () => Navigator.pushNamed(
+        context, '/tutors',
+        arguments: {'languageId': name},
+      ),
+      // กด Learners chip → ดู Leaderboard
+      onLearnersTap: () => Navigator.pushNamed(
+        context, '/leaderboard',
+        arguments: {'languageId': name},
+      ),
     );
   }
 }

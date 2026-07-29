@@ -14,30 +14,31 @@
 //   audioplayers: ^6.0.0
 //   video_player: ^2.8.2
 //   path_provider: ^2.1.2
-//   cloud_functions: ^4.6.0
-//   firebase_storage: ^11.6.0
 //   share_plus: ^7.2.2
 //   permission_handler: ^11.3.0
 // ============================================================
 
 import 'dart:async';
-import 'dart:io';
-import 'dart:convert';
+import 'dart:async' show StreamSubscription;
 import 'dart:math' as math;
+import 'dart:io';
 import 'package:flutter/material.dart';
-
 import 'package:audioplayers/audioplayers.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:firebase_storage/firebase_storage.dart';
-import 'package:cloud_functions/cloud_functions.dart';
-import 'package:permission_handler/permission_handler.dart';
+import 'package:flutter_sound/flutter_sound.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:http/http.dart' as http;
+import '../theme/app_theme.dart';
+import '../widgets/shared_widgets.dart';
+import '../services/tts_service.dart';
+import '../services/pronunciation_scoring_service.dart';
 
 // ─── Color Constants ────────────────────────────────────────
 const _kGreen = Color(0xFF2E7D32);
-const _kGreenMid = Color(0xFF388E3C);
 const _kGreenLight = Color(0xFFE8F5E9);
 const _kGreenBorder = Color(0xFFA5D6A7);
 const _kGold = Color(0xFFF5A623);
@@ -56,20 +57,26 @@ enum RecordingMode { aiPlusLearner, learnerOnly }
 
 // ─── Model ───────────────────────────────────────────────────
 class RecordingItem {
-  final int number;
-  final bool isCompleted;
-  final String? audioUrl;
+  final int     number;
+  final bool    isCompleted;
+  final String? audioUrl;      // URL เสียงจาก R2 หรือ local path
+  final String? localPath;     // path เสียงในเครื่อง
   final String? dateLabel;
   final String? duration;
-  final bool isLocked;
+  final bool    isLocked;
+  final int     score;         // pronunciation score 0-100
+  final String? docId;         // Firestore document ID
 
   const RecordingItem({
     required this.number,
     this.isCompleted = false,
     this.audioUrl,
+    this.localPath,
     this.dateLabel,
     this.duration,
     this.isLocked = false,
+    this.score    = 0,
+    this.docId,
   });
 }
 
@@ -80,12 +87,14 @@ class PracticePage extends StatefulWidget {
   final String tutorId;
   final String lessonId;
   final String languageId;
+  final String lessonText; // รับ text จากหน้าเลือกบทเรียนโดยตรง
 
   const PracticePage({
     super.key,
     this.tutorId = 'tutor_01',
     this.lessonId = 'lesson_01',
     this.languageId = 'English',
+    this.lessonText = '',
   });
 
   @override
@@ -96,11 +105,17 @@ class _PracticePageState extends State<PracticePage>
     with TickerProviderStateMixin {
 
   // ── Data ──
+  final _recorder = FlutterSoundRecorder();
+  PronunciationResult? _lastResult;
+  StreamSubscription? _recSub;
   Map<String, dynamic> _tutor = {};
   Map<String, dynamic> _lesson = {};
   List<RecordingItem> _recordings = [];
   bool _isLoading = true;
   bool _isPremium = false;
+
+  // ── TTS ──
+  bool _isTtsSpeaking = false;
 
   // ── Playback ──
   final AudioPlayer _audioPlayer = AudioPlayer();
@@ -143,6 +158,7 @@ class _PracticePageState extends State<PracticePage>
     _setupAnimations();
     _loadData();
     _setupAudioListeners();
+    TtsService.init(); // โหลด TTS config จาก Firestore
   }
 
   void _setupAnimations() {
@@ -187,10 +203,25 @@ class _PracticePageState extends State<PracticePage>
           .collection('tutors').doc(widget.tutorId).get();
       _tutor = tutorDoc.data() ?? _defaultTutor();
 
-      // Load lesson
-      final lessonDoc = await FirebaseFirestore.instance
-          .collection('lessons').doc(widget.lessonId).get();
-      _lesson = lessonDoc.data() ?? _defaultLesson();
+      // Load lesson — ถ้ามี lessonText ส่งมาให้ใช้เลย ไม่ต้องโหลดจาก Firestore
+      if (widget.lessonText.isNotEmpty) {
+        // ใช้ text ที่เลือกมาจากหน้า lesson_content_page โดยตรง
+        _lesson = {
+          'text': widget.lessonText,
+          'id': widget.lessonId,
+          'language': widget.languageId,
+          'wordCount': widget.lessonText.split(' ').length,
+        };
+      } else {
+        // fallback: โหลดจาก Firestore ด้วย lessonId
+        final lessonDoc = await FirebaseFirestore.instance
+            .collection('lessons').doc(widget.lessonId).get();
+        _lesson = lessonDoc.data() ?? _defaultLesson();
+        // ถ้า Firestore ไม่มีข้อมูล ใช้ default
+        if (_lesson.isEmpty || _lesson['text'] == null) {
+          _lesson = _defaultLesson();
+        }
+      }
 
       // Check premium
       if (uid != null) {
@@ -203,15 +234,18 @@ class _PracticePageState extends State<PracticePage>
             .collection('recordings')
             .where('userId', isEqualTo: uid)
             .where('lessonId', isEqualTo: widget.lessonId)
-            .orderBy('completedAt')
+            .orderBy('createdAt')
             .get();
 
         final loaded = recsSnap.docs.asMap().entries.map((e) => RecordingItem(
           number: e.key + 1,
           isCompleted: true,
-          audioUrl: e.value.data()['audioUrl'],
-          dateLabel: _formatDate(e.value.data()['completedAt']),
-          duration: '00:20',
+          audioUrl:  e.value.data()['audioUrl'] as String?,
+          localPath: e.value.data()['audioLocalPath'] as String?,
+          dateLabel: _formatDate(e.value.data()['createdAt']),
+          duration:  _formatDuration((e.value.data()['durationSeconds'] as num?)?.toInt() ?? 0),
+          score:     (e.value.data()['pronunciationScore'] as num?)?.toInt() ?? 0,
+          docId:     e.value.id,
         )).toList();
 
         _recordings = [
@@ -236,10 +270,7 @@ class _PracticePageState extends State<PracticePage>
       _tutor = _defaultTutor();
       _lesson = _defaultLesson();
       _recordings = [
-        const RecordingItem(number: 1, isCompleted: true,
-            dateLabel: 'May 25, 2026 12:20–12:40', duration: '00:20'),
-        ...List.generate(6, (i) => RecordingItem(number: i + 2)),
-        const RecordingItem(number: 8, isLocked: true),
+        // ไม่มีข้อมูลจริง → ใช้ list เปล่า
       ];
       if (mounted) setState(() => _isLoading = false);
     }
@@ -247,7 +278,7 @@ class _PracticePageState extends State<PracticePage>
 
   Map<String, dynamic> _defaultTutor() => {
     'name': 'AI Tutor', 'language': 'English', 'gender': 'Male',
-    'audioUrl': null, 'videoUrl': null,
+    'audioUrl': null, 'videoUrl': null, 'photoUrl': null,
   };
   Map<String, dynamic> _defaultLesson() => {
     'text': 'Hello everyone.  My name is Daniel, and today I want to talk about '
@@ -269,23 +300,37 @@ class _PracticePageState extends State<PracticePage>
   Future<void> _togglePlay() async {
     final audioUrl = _tutor['audioUrl'] as String?;
     if (audioUrl == null) {
-      // Demo mode: fake play
-      setState(() => _isPlaying = !_isPlaying);
-      if (_isPlaying) {
+      // ไม่มีวิดีโอ → ใช้ TTS อ่านบทเรียน
+      if (_isTtsSpeaking) {
+        await TtsService.stop();
+        setState(() { _isPlaying = false; _isTtsSpeaking = false; });
+        _waveController.stop();
+      } else {
+        setState(() { _isPlaying = true; _isTtsSpeaking = true; });
         _waveController.repeat(reverse: true);
-        // Fake progress
+        // TTS progress simulation
         Timer.periodic(const Duration(milliseconds: 500), (t) {
           if (!mounted || !_isPlaying) { t.cancel(); return; }
           setState(() { _playProgress = (_playProgress + 0.008).clamp(0.0, 1.0); });
-          if (_playProgress >= 1.0) { t.cancel(); setState(() => _isPlaying = false); }
+          if (_playProgress >= 1.0) {
+            t.cancel();
+            setState(() { _isPlaying = false; _isTtsSpeaking = false; });
+            _waveController.stop();
+          }
         });
-      } else {
-        _waveController.stop();
+        // เรียก TTS พูดบทเรียน
+        final lessonText = (_lesson['text'] as String?)?.isNotEmpty == true
+            ? _lesson['text'] as String
+            : 'Hello everyone. My name is Daniel, and today I want to talk about my daily routine.';
+        await TtsService.reload();  // reload config ใหม่จาก Firestore
+        await TtsService.speak(lessonText, languageId: widget.languageId);
+        if (mounted) setState(() { _isTtsSpeaking = false; });
       }
       return;
     }
     if (_isPlaying) {
       await _audioPlayer.pause();
+      await TtsService.stop();
       setState(() => _isPlaying = false);
       _waveController.stop();
     } else {
@@ -304,89 +349,257 @@ class _PracticePageState extends State<PracticePage>
   // ── Record ──
   Future<void> _toggleRecord() async {
     if (_isRecording) {
-      await _stopRecording();
+      await _stopRecording(); // หยุดก่อนเวลา
     } else {
-      await _startRecording();
+      await _startRecording(); // เริ่มฟัง + คำนวณ
     }
   }
 
   Future<void> _startRecording() async {
-    final status = await Permission.microphone.request();
-    if (!status.isGranted) {
-      _showSnack('ต้องการสิทธิ์ Microphone');
-      return;
+    // ขอสิทธิ์ microphone
+    final micOk = await Permission.microphone.request();
+    if (!micOk.isGranted) {
+      _showSnack('ต้องการสิทธิ์ Microphone', isError: true); return;
     }
-    final dir = await getTemporaryDirectory();
-    _currentRecordingPath =
-        '${dir.path}/rec_${DateTime.now().millisecondsSinceEpoch}.wav';
-    // TODO: integrate recording library after package conflict resolved
+
+    // สร้าง path ไฟล์เสียง
+    final dir  = await getTemporaryDirectory();
+    final path = '${dir.path}/rec_${DateTime.now().millisecondsSinceEpoch}.wav';
+    _currentRecordingPath = path;
+
+    // เริ่มบันทึกเสียง (record package)
+    await _recorder.openRecorder();
+    await _recorder.startRecorder(
+      toFile: path,
+      codec: Codec.pcm16WAV,
+      sampleRate: 16000,
+      numChannels: 1,
+    );
+
+    // เริ่ม STT พร้อมกัน
+    final sttOk = await PronunciationScoringService.init();
+
     _recordingSeconds = 0;
     _recordingTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() => _recordingSeconds++);
     });
     setState(() => _isRecording = true);
     _waveController.repeat(reverse: true);
-  }
 
-  Future<void> _stopRecording() async {
-    _recordingTimer?.cancel();
-    final path = _currentRecordingPath;
-    _waveController.stop();
-    setState(() => _isRecording = false);
-    if (path == null) return;
-    _showSnack('กำลังประเมินการออกเสียง...');
-    await _processRecording(path);
-  }
-
-  Future<void> _processRecording(String path) async {
-    try {
-      final audioBytes = await File(path).readAsBytes();
-      final audioBase64 = base64Encode(audioBytes);
-      final functions =
-          FirebaseFunctions.instanceFor(region: 'asia-southeast1');
-      final result =
-          await functions.httpsCallable('assessPronunciation').call({
-        'audioBase64': audioBase64,
-        'referenceText': _lesson['text'] ?? '',
-        'language': widget.languageId,
-      });
-      final score = (result.data['overallScore'] as num?)?.toInt() ?? 0;
-
-      // Animate new score
-      setState(() => _pronunciationScore = score);
-      _scoreController.forward(from: 0);
-
-      // Upload + save
-      final uid = FirebaseAuth.instance.currentUser?.uid;
-      if (uid != null) {
-        final ref = FirebaseStorage.instance
-            .ref('recordings/$uid/${DateTime.now().millisecondsSinceEpoch}.wav');
-        await ref.putFile(File(path));
-        final audioUrl = await ref.getDownloadURL();
-        await functions.httpsCallable('saveRecording').call({
-          'lessonId': widget.lessonId,
-          'tutorId': widget.tutorId,
-          'languageId': widget.languageId,
-          'audioUrl': audioUrl,
-          'pronunciationScore': score,
-          'durationSeconds': _recordingSeconds,
-          'displayMode': _displayMode.name,
-          'recordingMode': _recordingMode.name,
-        });
-        await _loadData();
-      }
-      _showSnack('บันทึกสำเร็จ! คะแนน: $score%');
-    } catch (e) {
-      // Demo fallback
-      setState(() { _pronunciationScore = 75 + math.Random().nextInt(20); });
-      _scoreController.forward(from: 0);
-      _showSnack('Demo mode: คะแนน $_pronunciationScore%');
+    // รับ STT result
+    if (sttOk) {
+      await PronunciationScoringService.listenOnly(
+        languageCode: _langCode(widget.languageId),
+        onResult: (text, conf) {
+          PronunciationScoringService.lastRecognized;
+        },
+      );
     }
   }
 
-  Future<void> _playRecording(String? url) async {
-    if (url == null) return;
-    await _audioPlayer.play(UrlSource(url));
+  // กด Stop → หยุดบันทึก + คำนวณคะแนน + บันทึก
+  Future<void> _finishRecording() async {
+    _recordingTimer?.cancel();
+    _waveController.stop();
+    setState(() => _isRecording = false);
+
+    // หยุด recorder
+    final stoppedPath = await _recorder.stopRecorder();
+    await PronunciationScoringService.stop();
+
+    final audioPath = stoppedPath ?? _currentRecordingPath;
+    final refText   = _lesson['text'] as String? ?? '';
+
+    if (audioPath == null || refText.isEmpty) {
+      _showSnack('ไม่พบไฟล์เสียง', isError: true); return;
+    }
+
+    _showSnack('⏳ กำลังประเมินการออกเสียง...');
+
+    // คำนวณคะแนน
+    final result = PronunciationScoringService.calculateScoreFromText(
+      referenceText:  refText,
+      recognizedText: PronunciationScoringService.lastRecognized,
+      confidence:     PronunciationScoringService.lastConfidence,
+    );
+
+    setState(() { _pronunciationScore = result.overallScore; _lastResult = result; });
+    _scoreController.forward(from: 0);
+
+    // บันทึกลง Firestore + อัปโหลดเสียง
+    await _saveRecordingResult(result, audioPath: audioPath);
+    _showScoreSheet(result);
+  }
+
+  // แปลงชื่อภาษาเป็น locale code
+  String _langCode(String lang) {
+    const map = {
+      'English':  'en-US',
+      'Japanese': 'ja-JP',
+      'Chinese':  'zh-CN',
+      'Korean':   'ko-KR',
+      'Spanish':  'es-ES',
+      'French':   'fr-FR',
+    };
+    return map[lang] ?? 'en-US';
+  }
+
+  // บันทึกผลลง Firestore
+  Future<void> _saveRecordingResult(PronunciationResult result,
+      {String? audioPath}) async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+
+    // เก็บ local path ไว้เล่น/ดาวน์โหลดในเครื่อง
+    String? finalAudioPath = audioPath;
+
+    try {
+      final docRef = await FirebaseFirestore.instance
+          .collection('recordings')
+          .add({
+        'userId':             uid,
+        'lessonId':           widget.lessonId,
+        'tutorId':            widget.tutorId,
+        'languageId':         widget.languageId,
+        'lessonText':         _lesson['text'] ?? '',
+        'recognizedText':     result.recognizedText,
+        'pronunciationScore': result.overallScore,
+        'accuracyScore':      result.accuracyScore,
+        'completenessScore':  result.completenessScore,
+        'fluencyScore':       result.fluencyScore,
+        'durationSeconds':    _recordingSeconds,
+        'audioLocalPath':     finalAudioPath ?? '',
+        'isCompleted':        true,
+        'createdAt':          FieldValue.serverTimestamp(),
+      });
+
+      // อัปเดต practice time
+      await FirebaseFirestore.instance.collection('users').doc(uid).set({
+        'totalPracticeMinutes': FieldValue.increment(_recordingSeconds / 60),
+        'lastActiveDate':       FieldValue.serverTimestamp(),
+        'streakDays':           FieldValue.increment(0), // อัปเดต streak แยก
+      }, SetOptions(merge: true));
+
+      // เพิ่ม recording ใหม่ใน list
+      final newItem = RecordingItem(
+        number:      _recordings.where((r) => r.isCompleted).length + 1,
+        isCompleted: true,
+        localPath:   finalAudioPath,
+        dateLabel:   _formatDate(null),
+        duration:    _formatDuration(_recordingSeconds),
+        score:       result.overallScore,
+        docId:       docRef.id,
+      );
+      if (mounted) {
+        setState(() {
+          _recordings = [newItem, ..._recordings.where((r) => r.isCompleted || !r.isCompleted).toList()];
+        });
+      }
+      await _loadData();
+    } catch (e) {
+      debugPrint('save error: $e');
+    }
+  }
+
+  // format duration
+  String _formatDuration(int secs) {
+    final m = (secs ~/ 60).toString().padLeft(2, '0');
+    final s = (secs % 60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+
+  // แสดง Score Sheet หลังฝึก
+  void _showScoreSheet(PronunciationResult result) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _ScoreSheet(result: result, onClose: () => Navigator.pop(context)),
+    );
+  }
+
+  Future<void> _stopRecording() async {
+    await _finishRecording();
+  }
+
+
+  Future<void> _playRecording(RecordingItem rec) async {
+    // เล่นจาก local path ก่อน ถ้าไม่มีค่อยใช้ URL
+    if (rec.localPath != null && File(rec.localPath!).existsSync()) {
+      await _audioPlayer.play(DeviceFileSource(rec.localPath!));
+    } else if (rec.audioUrl != null) {
+      await _audioPlayer.play(UrlSource(rec.audioUrl!));
+    } else {
+      _showSnack('ไม่พบไฟล์เสียง', isError: true);
+    }
+  }
+
+  // ── ดาวน์โหลดเสียงไปเครื่อง ─────────────────────────────────
+  Future<void> _downloadRecording(RecordingItem rec) async {
+    if (rec.localPath != null && File(rec.localPath!).existsSync()) {
+      // มีไฟล์ในเครื่องแล้ว → copy ไป Downloads
+      try {
+        final dlDir   = Directory('/storage/emulated/0/Download');
+        final exists  = await dlDir.exists();
+        final saveDir = exists ? dlDir : await getApplicationDocumentsDirectory();
+        final fileName = 'shadows_rec_${rec.number.toString().padLeft(3, "0")}.wav';
+        final savePath = '${saveDir.path}/$fileName';
+        await File(rec.localPath!).copy(savePath);
+        _showSnack('✅ บันทึกที่ $fileName');
+      } catch (e) {
+        _showSnack('ดาวน์โหลดไม่สำเร็จ: $e', isError: true);
+      }
+      return;
+    }
+    if (rec.audioUrl == null) {
+      _showSnack('ไม่พบไฟล์เสียง', isError: true);
+      return;
+    }
+    // ดาวน์โหลดจาก URL
+    _showSnack('⏳ กำลังดาวน์โหลด...');
+    try {
+      final resp     = await http.get(Uri.parse(rec.audioUrl!));
+      final dlDir    = Directory('/storage/emulated/0/Download');
+      final exists   = await dlDir.exists();
+      final saveDir  = exists ? dlDir : await getApplicationDocumentsDirectory();
+      final fileName = 'shadows_rec_${rec.number.toString().padLeft(3, "0")}.wav';
+      final file     = File('${saveDir.path}/$fileName');
+      await file.writeAsBytes(resp.bodyBytes);
+      _showSnack('✅ ดาวน์โหลดแล้ว: $fileName');
+    } catch (e) {
+      _showSnack('ดาวน์โหลดไม่สำเร็จ', isError: true);
+    }
+  }
+
+  // ── แชรเสียง ────────────────────────────────────────────────
+  Future<void> _shareRecording(RecordingItem rec) async {
+    String? sharePath = rec.localPath;
+    if (sharePath == null || !File(sharePath).existsSync()) {
+      if (rec.audioUrl != null) {
+        // download ก่อนแล้วค่อยแชร
+        _showSnack('⏳ กำลังเตรียมไฟล์...');
+        try {
+          final resp  = await http.get(Uri.parse(rec.audioUrl!));
+          final dir   = await getTemporaryDirectory();
+          sharePath   = '${dir.path}/share_rec_${rec.number}.wav';
+          await File(sharePath).writeAsBytes(resp.bodyBytes);
+        } catch (_) { sharePath = null; }
+      }
+    }
+
+    final scoreText = rec.score > 0 ? ' คะแนน ${rec.score}%' : '';
+    final msg = '🎙️ ฝึกภาษาด้วย Shadows by yannawut!$scoreText\n'
+        'บทเรียน: ${(_lesson['category'] ?? widget.lessonId)}\n'
+        '#ShadowsApp #ฝึกพูดภาษาอังกฤษ';
+
+    if (sharePath != null && File(sharePath).existsSync()) {
+      await Share.shareXFiles(
+        [XFile(sharePath, mimeType: 'audio/wav')],
+        text: msg,
+      );
+    } else {
+      await Share.share(msg);
+    }
   }
 
   Future<void> _deleteSelected() async {
@@ -409,12 +622,40 @@ class _PracticePageState extends State<PracticePage>
       ),
     );
     if (confirm == true) {
-      setState(() => _selectedRecordings.clear());
-      _showSnack('ลบแล้ว');
+      // ลบจาก Firestore
+      for (final num in List.from(_selectedRecordings)) {
+        final matches = _recordings.where((r) => r.number == num).toList();
+        if (matches.isNotEmpty) {
+          final rec = matches.first;
+          if (rec.docId != null) {
+            try {
+              await FirebaseFirestore.instance
+                  .collection('recordings').doc(rec.docId).delete();
+            } catch (_) {}
+          }
+          if (rec.localPath != null) {
+            try {
+              final f = File(rec.localPath!);
+              if (await f.exists()) await f.delete();
+            } catch (_) {}
+          }
+        }
+      }
+      setState(() {
+        _recordings = _recordings.map((r) {
+          if (_selectedRecordings.contains(r.number)) {
+            return RecordingItem(number: r.number);
+          }
+          return r;
+        }).toList();
+        _selectedRecordings.clear();
+      });
+      _showSnack('ลบแล้ว ✓');
+      await _loadData();
     }
   }
 
-  void _showSnack(String msg) {
+  void _showSnack(String msg, {bool isError = false}) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text(msg),
@@ -439,7 +680,9 @@ class _PracticePageState extends State<PracticePage>
   @override
   void dispose() {
     _audioPlayer.dispose();
-    // recorder disposed
+    _recSub?.cancel();
+    _recorder.closeRecorder();  // flutter_sound: ไม่ต้อง await ใน dispose
+    TtsService.dispose();
     _recordingTimer?.cancel();
     _waveController.dispose();
     _scoreController.dispose();
@@ -512,7 +755,11 @@ class _PracticePageState extends State<PracticePage>
           // Tutor half
           Expanded(child: Container(
             color: const Color(0xFF2D3A2D),
-            child: _TutorVideoPlaceholder(name: _tutor['name'] ?? 'Tutor', isMale: true),
+            child: _TutorVideoPlaceholder(
+              name: _tutor['name'] ?? 'Tutor',
+              photoUrl: _tutor['photoUrl'] as String?,
+              videoUrl: _tutor['videoUrl'] as String?,
+              isMale: true),
           )),
           // Divider line
           Container(width: 2, color: Colors.black),
@@ -526,7 +773,11 @@ class _PracticePageState extends State<PracticePage>
         return Row(children: [
           Expanded(child: Container(
             color: const Color(0xFF2D3A2D),
-            child: _TutorVideoPlaceholder(name: _tutor['name'] ?? 'Tutor', isMale: true),
+            child: _TutorVideoPlaceholder(
+              name: _tutor['name'] ?? 'Tutor',
+              photoUrl: _tutor['photoUrl'] as String?,
+              videoUrl: _tutor['videoUrl'] as String?,
+              isMale: true),
           )),
           Container(width: 2, color: Colors.black),
           Expanded(child: Container(
@@ -713,52 +964,36 @@ class _PracticePageState extends State<PracticePage>
 
   // ── CONTROLS ROW ─────────────────────────────────────────
   Widget _buildControlsRow() {
-    return SingleChildScrollView(
-      scrollDirection: Axis.horizontal,
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      child: Row(children: [
-        _CtrlBtn(
-          icon: Icons.replay,
-          label: 'Replay',
-          onTap: _replay,
-        ),
-        const SizedBox(width: 6),
-        _CtrlBtn(
-          icon: _isPlaying ? Icons.pause : Icons.play_arrow,
-          label: _isPlaying ? 'Pause' : 'Play',
-          isActive: true,
-          activeColor: _kGreen,
-          onTap: _togglePlay,
-        ),
-        const SizedBox(width: 6),
-        _CtrlBtn(
-          icon: Icons.speed,
-          label: 'Adjustable Speed',
-          subLabel: 'Members only',
-          isLocked: !_isPremium,
-          onTap: _isPremium
-              ? () => _showSpeedDialog()
-              : () => Navigator.pushNamed(context, '/premium'),
-        ),
-        const SizedBox(width: 6),
-        _CtrlBtn(
-          icon: _isRecording ? Icons.stop_circle : Icons.mic,
-          label: _isRecording ? 'Stop $_recordingTimerLabel' : 'Record Voice',
-          isActive: _isRecording,
-          activeColor: _kRed,
-          onTap: _toggleRecord,
-        ),
-        const SizedBox(width: 6),
-        _CtrlBtn(
-          icon: Icons.compare_arrows,
-          label: 'Compare Voice',
-          subLabel: 'Members only',
-          isLocked: !_isPremium,
-          onTap: _isPremium
-              ? () => _showCompareDialog()
-              : () => Navigator.pushNamed(context, '/premium'),
-        ),
-      ]),
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+        children: [
+          _CtrlBtn(icon: Icons.replay, label: 'Replay', onTap: _replay),
+          _CtrlBtn(
+            icon: _isPlaying ? Icons.pause : Icons.play_arrow,
+            label: _isPlaying ? 'Pause' : 'Play',
+            isActive: true, activeColor: _kGreen, onTap: _togglePlay,
+          ),
+          _CtrlBtn(
+            icon: Icons.speed, label: 'Adjustable Speed',
+            subLabel: 'Members only', isLocked: !_isPremium,
+            onTap: _isPremium ? () => _showSpeedDialog()
+                : () => Navigator.pushNamed(context, '/premium'),
+          ),
+          _CtrlBtn(
+            icon: _isRecording ? Icons.stop_circle : Icons.mic,
+            label: _isRecording ? 'Stop $_recordingTimerLabel' : 'Record Voice',
+            isActive: _isRecording, activeColor: _kRed, onTap: _toggleRecord,
+          ),
+          _CtrlBtn(
+            icon: Icons.compare_arrows, label: 'Compare Voice',
+            subLabel: 'Members only', isLocked: !_isPremium,
+            onTap: _isPremium ? () => _showCompareDialog()
+                : () => Navigator.pushNamed(context, '/premium'),
+          ),
+        ],
+      ),
     );
   }
 
@@ -1041,7 +1276,7 @@ class _PracticePageState extends State<PracticePage>
             )
           else if (rec.isCompleted) ...[
             GestureDetector(
-              onTap: () => _playRecording(rec.audioUrl),
+              onTap: () => _playRecording(rec),
               child: Container(
                 width: 28, height: 28,
                 decoration: const BoxDecoration(color: _kGreen, shape: BoxShape.circle),
@@ -1062,28 +1297,36 @@ class _PracticePageState extends State<PracticePage>
   // ── SHARE ROW ─────────────────────────────────────────────
   Widget _buildShareRow() {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(14, 12, 14, 4),
-      child: Row(mainAxisAlignment: MainAxisAlignment.start, children: [
-        _ShareIcon(
-          icon: '🎵', label: 'TikTok / Reels', bgColor: Colors.black,
-          onTap: () => Share.share('Check out my Shadows practice! #ShadowsApp'),
-        ),
-        const SizedBox(width: 20),
-        _ShareIcon(
-          icon: '▶', label: 'YouTube', bgColor: const Color(0xFFFF0000), isText: true,
-          onTap: () {},
-        ),
-        const SizedBox(width: 20),
-        _ShareIcon(
-          icon: 'f', label: 'Facebook', bgColor: const Color(0xFF1877F2), isText: true,
-          onTap: () {},
-        ),
-        const SizedBox(width: 20),
-        _ShareIcon(
-          icon: '💬', label: 'LINE', bgColor: const Color(0xFF00C300),
-          onTap: () {},
-        ),
-      ]),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceAround,
+        children: [
+          _ShareIcon(brand: _ShareBrand.tiktok, label: 'TikTok/Reels',
+            onTap: () {
+              final completed = _recordings.where((r) => r.isCompleted).toList();
+              if (completed.isNotEmpty) _shareRecording(completed.last);
+              else Share.share('ฝึกภาษากับ Shadows by yannawut! 🎧 #ShadowsApp');
+            }),
+          _ShareIcon(brand: _ShareBrand.youtube, label: 'YouTube',
+            onTap: () {
+              final completed = _recordings.where((r) => r.isCompleted).toList();
+              if (completed.isNotEmpty) _shareRecording(completed.last);
+              else Share.share('ฝึกภาษากับ Shadows by yannawut! 🎧 #ShadowsApp');
+            }),
+          _ShareIcon(brand: _ShareBrand.facebook, label: 'Facebook',
+            onTap: () {
+              final completed = _recordings.where((r) => r.isCompleted).toList();
+              if (completed.isNotEmpty) _shareRecording(completed.last);
+              else Share.share('ฝึกภาษากับ Shadows by yannawut! 🎧 #ShadowsApp');
+            }),
+          _ShareIcon(brand: _ShareBrand.line, label: 'LINE',
+            onTap: () {
+              final completed = _recordings.where((r) => r.isCompleted).toList();
+              if (completed.isNotEmpty) _shareRecording(completed.last);
+              else Share.share('ฝึกภาษากับ Shadows by yannawut! 🎧 #ShadowsApp');
+            }),
+        ],
+      ),
     );
   }
 
@@ -1109,9 +1352,16 @@ class _PracticePageState extends State<PracticePage>
       child: Row(children: [
         // Download
         Expanded(child: OutlinedButton.icon(
-          onPressed: () => _showSnack('กำลัง Download...'),
+          onPressed: () {
+            final completed = _recordings.where((r) => r.isCompleted).toList();
+            if (completed.isEmpty) {
+              _showSnack('ยังไม่มีการบันทึกเสียง');
+            } else {
+              _downloadRecording(completed.last);
+            }
+          },
           icon: const Icon(Icons.download_outlined, size: 17, color: _kText),
-          label: const Text('Download Video',
+          label: const Text('Download Audio',
             style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: _kText)),
           style: OutlinedButton.styleFrom(
             padding: const EdgeInsets.symmetric(vertical: 14),
@@ -1122,9 +1372,14 @@ class _PracticePageState extends State<PracticePage>
         const SizedBox(width: 10),
         // Share Together
         Expanded(child: ElevatedButton.icon(
-          onPressed: () => Share.share(
-            'ฝึกภาษากับ Shadows by yannawut! 🎧\nคะแนนของฉัน: $_pronunciationScore%',
-          ),
+          onPressed: () {
+            final completed = _recordings.where((r) => r.isCompleted).toList();
+            if (completed.isNotEmpty) {
+              _shareRecording(completed.last);
+            } else {
+              Share.share('ฝึกภาษากับ Shadows by yannawut! 🎧 #ShadowsApp');
+            }
+          },
           icon: const Icon(Icons.share, size: 17, color: Colors.white),
           label: const Text('Share Together',
             style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.white)),
@@ -1226,40 +1481,68 @@ class _CtrlBtn extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // คำนวณความกว้างจากหน้าจอ: (screenW - padding) / 5
+    final btnW = (MediaQuery.of(context).size.width - 20) / 5;
+    final iconSize = (btnW * 0.75).clamp(40.0, 54.0);
     return GestureDetector(
       onTap: onTap,
-      child: SizedBox(width: 70, child: Column(mainAxisSize: MainAxisSize.min, children: [
-        AnimatedContainer(
-          duration: const Duration(milliseconds: 200),
-          width: 50, height: 50,
-          decoration: BoxDecoration(
-            color: isLocked ? _kGoldLight
-                : isActive ? activeColor
-                : Colors.white,
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(
-              color: isLocked ? _kGold
-                  : isActive ? activeColor
-                  : _kBorder,
-              width: 1.5,
+      child: SizedBox(
+        width: btnW,
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Stack(alignment: Alignment.topLeft, children: [
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 200),
+              width: iconSize, height: iconSize,
+              decoration: BoxDecoration(
+                color: isLocked ? _kGoldLight
+                    : isActive ? activeColor
+                    : Colors.white,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: isLocked ? _kGold
+                      : isActive ? activeColor
+                      : _kBorder,
+                  width: 1.5,
+                ),
+                boxShadow: isActive ? [BoxShadow(
+                  color: activeColor.withValues(alpha: 0.25),
+                  blurRadius: 6, spreadRadius: 1,
+                )] : null,
+              ),
+              child: Center(
+                child: Icon(
+                  isLocked ? Icons.lock : icon,
+                  size: iconSize * 0.44,
+                  color: isLocked ? _kGold
+                      : isActive ? Colors.white
+                      : _kSub,
+                ),
+              ),
             ),
-            boxShadow: isActive ? [BoxShadow(
-              color: activeColor.withValues(alpha: 0.3), blurRadius: 8, spreadRadius: 1,
-            )] : null,
-          ),
-          child: Center(child: isLocked
-              ? const Icon(Icons.lock, size: 20, color: _kGold)
-              : Icon(icon, size: 22, color: isActive ? Colors.white : _kSub)),
-        ),
-        const SizedBox(height: 4),
-        Text(label,
-          style: const TextStyle(fontSize: 10, color: _kSub, height: 1.2),
-          textAlign: TextAlign.center, maxLines: 2),
-        if (subLabel != null)
-          Text(subLabel!,
-            style: const TextStyle(fontSize: 9, color: _kGold, fontWeight: FontWeight.w600),
-            textAlign: TextAlign.center),
-      ])),
+            if (isLocked)
+              Positioned(
+                top: 3, left: 3,
+                child: Container(
+                  width: 14, height: 14,
+                  decoration: const BoxDecoration(
+                    color: _kGold, shape: BoxShape.circle,
+                  ),
+                  child: const Icon(Icons.lock, size: 8, color: Colors.white),
+                ),
+              ),
+          ]),
+          const SizedBox(height: 3),
+          Text(label,
+            style: const TextStyle(fontSize: 9, color: _kSub, height: 1.2),
+            textAlign: TextAlign.center, maxLines: 2,
+            overflow: TextOverflow.ellipsis),
+          if (subLabel != null)
+            Text(subLabel!,
+              style: const TextStyle(fontSize: 8, color: _kGold,
+                  fontWeight: FontWeight.w600),
+              textAlign: TextAlign.center),
+        ]),
+      ),
     );
   }
 }
@@ -1367,31 +1650,58 @@ class _RecordModeCard extends StatelessWidget {
 }
 
 // ─── Share Icon ──────────────────────────────────────────────
-class _ShareIcon extends StatelessWidget {
-  final String icon, label;
-  final Color bgColor;
-  final bool isText;
-  final VoidCallback? onTap;
+enum _ShareBrand { tiktok, youtube, facebook, line }
 
-  const _ShareIcon({
-    required this.icon, required this.label,
-    required this.bgColor, this.isText = false, this.onTap,
-  });
+class _ShareIcon extends StatelessWidget {
+  final _ShareBrand brand;
+  final String label;
+  final VoidCallback? onTap;
+  const _ShareIcon({required this.brand, required this.label, this.onTap});
 
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: onTap,
       child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Container(width: 38, height: 38,
-          decoration: BoxDecoration(color: bgColor, borderRadius: BorderRadius.circular(10)),
-          child: Center(child: isText
-              ? Text(icon, style: const TextStyle(fontSize: 18, color: Colors.white, fontWeight: FontWeight.w900))
-              : Text(icon, style: const TextStyle(fontSize: 18)))),
-        const SizedBox(height: 4),
-        Text(label, style: const TextStyle(fontSize: 10, color: _kSub), textAlign: TextAlign.center),
+        Container(
+          width: 44, height: 44,
+          decoration: BoxDecoration(
+            color: _bgColor, borderRadius: BorderRadius.circular(12)),
+          child: Center(child: _buildIcon()),
+        ),
+        const SizedBox(height: 5),
+        Text(label,
+          style: const TextStyle(fontSize: 10, color: _kSub,
+              fontWeight: FontWeight.w500),
+          textAlign: TextAlign.center, maxLines: 2,
+          overflow: TextOverflow.ellipsis),
       ]),
     );
+  }
+
+  Color get _bgColor {
+    switch (brand) {
+      case _ShareBrand.tiktok:   return Colors.black;
+      case _ShareBrand.youtube:  return const Color(0xFFFF0000);
+      case _ShareBrand.facebook: return const Color(0xFF1877F2);
+      case _ShareBrand.line:     return const Color(0xFF00C300);
+    }
+  }
+
+  Widget _buildIcon() {
+    switch (brand) {
+      case _ShareBrand.tiktok:
+        return const Text('TT', style: TextStyle(
+            fontSize: 15, color: Colors.white, fontWeight: FontWeight.w900));
+      case _ShareBrand.youtube:
+        return const Icon(Icons.play_arrow_rounded,
+            color: Colors.white, size: 28);
+      case _ShareBrand.facebook:
+        return const Text('f', style: TextStyle(
+            fontSize: 22, color: Colors.white, fontWeight: FontWeight.w900));
+      case _ShareBrand.line:
+        return const Icon(Icons.chat_bubble, color: Colors.white, size: 20);
+    }
   }
 }
 
@@ -1457,47 +1767,60 @@ class _NavItem extends StatelessWidget {
 
 // ─── Video Placeholders ──────────────────────────────────────
 class _TutorVideoPlaceholder extends StatelessWidget {
-  final String name;
-  final bool isMale;
-  const _TutorVideoPlaceholder({required this.name, required this.isMale});
+  final String  name;
+  final bool    isMale;
+  final String? photoUrl;
+  final String? videoUrl;
+  const _TutorVideoPlaceholder({
+    required this.name,
+    this.isMale  = true,
+    this.photoUrl,
+    this.videoUrl,
+  });
 
   @override
   Widget build(BuildContext context) {
     return Stack(fit: StackFit.expand, children: [
-      // Background gradient simulating room
+      // Background
       Container(decoration: BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topCenter, end: Alignment.bottomCenter,
           colors: isMale
-              ? [const Color(0xFF2D4A35), const Color(0xFF1A2E1B)]
-              : [const Color(0xFF4A3535), const Color(0xFF2E1B1B)],
+            ? [const Color(0xFF2D3A2D), const Color(0xFF1B2B1B)]
+            : [const Color(0xFF3A2D2D), const Color(0xFF2B1B1B)],
         ),
       )),
-      // Bookshelf hint
-      Positioned(top: 0, left: 0, right: 0, child: Container(
-        height: 40,
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            colors: [Colors.brown.withValues(alpha: 0.4), Colors.transparent],
-            begin: Alignment.topCenter, end: Alignment.bottomCenter,
-          ),
-        ),
-      )),
-      // Person silhouette
-      Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Container(width: 70, height: 70,
+      // รูป Tutor จาก R2 (ถ้ามี)
+      if (photoUrl != null && photoUrl!.isNotEmpty)
+        Positioned.fill(child: CachedNetworkImage(
+          imageUrl: photoUrl!,
+          cacheKey: photoUrl,  // ใช้ URL เป็น key — เมื่อ URL เปลี่ยนจะโหลดใหม่
+          fit: BoxFit.cover,
+          placeholder: (_, __) => const SizedBox(),
+          errorWidget: (_, __, ___) => _buildPersonIcon(),
+        ))
+      else
+        _buildPersonIcon(),
+      // ชื่อ overlay ล่าง
+      Positioned(bottom: 8, left: 0, right: 0,
+        child: Center(child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
           decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: isMale ? const Color(0xFFD4A574) : const Color(0xFFE8C5A0),
-          ),
-          child: const Icon(Icons.person, size: 48, color: Colors.white70)),
-        const SizedBox(height: 8),
-        Text(name, style: const TextStyle(color: Colors.white60, fontSize: 12)),
-      ])),
+            color: Colors.black.withValues(alpha: 0.5),
+            borderRadius: BorderRadius.circular(20)),
+          child: Text(name, style: const TextStyle(
+            color: Colors.white, fontSize: 11, fontWeight: FontWeight.w600))))),
     ]);
   }
-}
 
+  Widget _buildPersonIcon() => Center(child: Column(
+    mainAxisSize: MainAxisSize.min, children: [
+      Container(width: 70, height: 70,
+        decoration: BoxDecoration(shape: BoxShape.circle,
+          color: isMale ? const Color(0xFFD4A574) : const Color(0xFFE8C5A0)),
+        child: const Icon(Icons.person, size: 48, color: Colors.white70)),
+    ]));
+}
 class _MascotAvatar extends StatelessWidget {
   const _MascotAvatar();
 
@@ -1719,4 +2042,167 @@ class _CompareSheet extends StatelessWidget {
       ]),
     );
   }
+}
+
+// ── Score Sheet Bottom Sheet ──────────────────────────────────
+class _ScoreSheet extends StatelessWidget {
+  final PronunciationResult result;
+  final VoidCallback onClose;
+  const _ScoreSheet({required this.result, required this.onClose});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.15), blurRadius: 20)],
+      ),
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        // Handle
+        Container(margin: const EdgeInsets.only(top: 12),
+          width: 40, height: 4,
+          decoration: BoxDecoration(color: const Color(0xFFE0E0E0), borderRadius: BorderRadius.circular(2))),
+
+        // Score circle
+        Padding(padding: const EdgeInsets.all(20), child: Column(children: [
+          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            SizedBox(width: 100, height: 100,
+              child: Stack(alignment: Alignment.center, children: [
+                SizedBox(width: 100, height: 100,
+                  child: CircularProgressIndicator(
+                    value: result.overallScore / 100,
+                    strokeWidth: 10,
+                    backgroundColor: const Color(0xFFE8F5E9),
+                    valueColor: AlwaysStoppedAnimation(result.color),
+                    strokeCap: StrokeCap.round,
+                  )),
+                Column(mainAxisSize: MainAxisSize.min, children: [
+                  Text('${result.overallScore}%',
+                    style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800,
+                      color: result.color, fontFamily: 'NotoSans')),
+                  const Text('Match', style: TextStyle(fontSize: 10, color: Color(0xFF757575))),
+                ]),
+              ])),
+            const SizedBox(width: 24),
+            Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              _miniBar('Accuracy',     result.accuracyScore,     const Color(0xFF4CAF50)),
+              const SizedBox(height: 6),
+              _miniBar('Fluency',      result.fluencyScore,       const Color(0xFF2196F3)),
+              const SizedBox(height: 6),
+              _miniBar('Completeness', result.completenessScore,  const Color(0xFF9C27B0)),
+            ]),
+          ]),
+
+          const SizedBox(height: 12),
+          // Grade badge
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+            decoration: BoxDecoration(
+              color: result.color.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(20)),
+            child: Text('Grade ${result.grade} — ${result.feedback}',
+              style: TextStyle(fontSize: 13, color: result.color,
+                fontWeight: FontWeight.w600, fontFamily: 'NotoSans'),
+              textAlign: TextAlign.center)),
+
+          // Recognized text
+          if (result.recognizedText.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFF5F5F5),
+                borderRadius: BorderRadius.circular(10)),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const Text('🎤 ที่ได้ยิน:', style: TextStyle(fontSize: 11,
+                  color: Color(0xFF757575), fontFamily: 'NotoSans')),
+                const SizedBox(height: 4),
+                Text(result.recognizedText, style: const TextStyle(
+                  fontSize: 13, color: Color(0xFF212121), fontFamily: 'NotoSans')),
+              ])),
+          ],
+
+          // Word chips
+          if (result.words.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            const Align(alignment: Alignment.centerLeft,
+              child: Text('คำต่อคำ:', style: TextStyle(fontSize: 11,
+                color: Color(0xFF757575), fontFamily: 'NotoSans'))),
+            const SizedBox(height: 6),
+            Wrap(spacing: 6, runSpacing: 6,
+              children: result.words.where((w) => !w.extra).map((w) =>
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: w.color.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: w.color.withValues(alpha: 0.4))),
+                  child: Text(w.word, style: TextStyle(
+                    fontSize: 12, color: w.color,
+                    fontWeight: w.correct ? FontWeight.w400 : FontWeight.w700,
+                    fontFamily: 'NotoSans')))
+              ).toList()),
+            const SizedBox(height: 4),
+            const Row(children: [
+              _Legend(color: Color(0xFF4CAF50), label: 'ถูก'),
+              SizedBox(width: 8),
+              _Legend(color: Color(0xFFFF9800), label: 'ลืมพูด'),
+              SizedBox(width: 8),
+              _Legend(color: Color(0xFFE53935), label: 'ผิด'),
+            ]),
+          ],
+
+          const SizedBox(height: 16),
+          // Buttons
+          Row(children: [
+            Expanded(child: OutlinedButton(
+              onPressed: onClose,
+              style: OutlinedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+              child: const Text('ปิด'))),
+            const SizedBox(width: 10),
+            Expanded(child: ElevatedButton(
+              onPressed: onClose,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF2E7D32),
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+              child: const Text('ฝึกอีกครั้ง', style: TextStyle(color: Colors.white)))),
+          ]),
+        ])),
+      ]),
+    );
+  }
+
+  Widget _miniBar(String label, int score, Color color) => SizedBox(
+    width: 160,
+    child: Row(children: [
+      SizedBox(width: 70, child: Text(label, style: const TextStyle(
+        fontSize: 10, color: Color(0xFF757575), fontFamily: 'NotoSans'))),
+      Expanded(child: ClipRRect(
+        borderRadius: BorderRadius.circular(4),
+        child: LinearProgressIndicator(
+          value: score / 100,
+          backgroundColor: const Color(0xFFE0E0E0),
+          valueColor: AlwaysStoppedAnimation(color),
+          minHeight: 6))),
+      const SizedBox(width: 4),
+      Text('$score', style: TextStyle(fontSize: 10, fontWeight: FontWeight.w700,
+        color: color, fontFamily: 'NotoSans')),
+    ]),
+  );
+}
+
+class _Legend extends StatelessWidget {
+  final Color color; final String label;
+  const _Legend({required this.color, required this.label});
+  @override Widget build(BuildContext context) => Row(mainAxisSize: MainAxisSize.min, children: [
+    Container(width: 10, height: 10, decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(2))),
+    const SizedBox(width: 3),
+    Text(label, style: const TextStyle(fontSize: 10, color: Color(0xFF757575))),
+  ]);
 }

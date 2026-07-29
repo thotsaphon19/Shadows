@@ -263,7 +263,7 @@ class _ProfilePageState extends State<ProfilePage> {
     final doc = await FirebaseFirestore.instance.collection('users').doc(uid).get();
     if (mounted) {
       setState(() => _user = doc.data() ?? {
-      'displayName': 'Noi Shadow', 'package': 'free',
+      'displayName': '', 'package': 'free',
       'ageGroup': 22, 'gender': 'Female',
     });
     }
@@ -308,7 +308,8 @@ class _ProfilePageState extends State<ProfilePage> {
           _row(Icons.link, 'Manage Connected Accounts'),
           _row(Icons.logout, 'Log Out', onTap: () async {
             await FirebaseAuth.instance.signOut();
-            if (mounted) Navigator.pushReplacementNamed(context, '/login');
+            if (!mounted) return;
+            Navigator.pushReplacementNamed(context, '/login');
           }),
           _row(Icons.delete_outline, 'Delete Account', isDanger: true),
         ]),

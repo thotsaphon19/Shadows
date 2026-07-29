@@ -1,18 +1,18 @@
 // lib/pages/tutor_selection_page.dart
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import '../theme/app_theme.dart';
 import '../widgets/shared_widgets.dart';
 
 class TutorSelectionPage extends StatefulWidget {
-  final String lessonId, languageId, category;
-  final int wordCount;
+  final String languageId;
   const TutorSelectionPage({
     super.key,
-    this.lessonId = '', this.languageId = 'English',
-    this.category = '', this.wordCount = 50,
+    this.languageId = 'English',
   });
   @override State<TutorSelectionPage> createState() => _TutorSelectionPageState();
 }
@@ -46,26 +46,38 @@ class _TutorSelectionPageState extends State<TutorSelectionPage> {
   @override
   void initState() { super.initState(); _load(); }
 
+  StreamSubscription? _tutorSub;
+
+  @override void dispose() {
+    _tutorSub?.cancel();
+    _player.dispose();
+    super.dispose();
+  }
+
   Future<void> _load() async {
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid != null) {
       final u = await FirebaseFirestore.instance.collection('users').doc(uid).get();
       _isPremium = u.data()?['package'] == 'premium';
     }
-    try {
-      final snap = await FirebaseFirestore.instance
-          .collection('tutors')
-          .where('language', isEqualTo: widget.languageId)
-          .get();
+
+    // Real-time stream — Admin เพิ่ม/แก้ Tutor → แสดงทันที
+    _tutorSub?.cancel();
+    _tutorSub = FirebaseFirestore.instance
+        .collection('tutors')
+        .where('language', isEqualTo: widget.languageId)
+        .snapshots()
+        .listen((snap) {
       if (!mounted) return;
       setState(() {
-        _tutors = snap.docs.isEmpty ? _demoTutors
+        _tutors = snap.docs.isEmpty
+            ? _demoTutors
             : snap.docs.map((d) => {...d.data(), 'id': d.id}).toList();
         _loading = false;
       });
-    } catch (_) {
+    }, onError: (_) {
       if (mounted) setState(() { _tutors = _demoTutors; _loading = false; });
-    }
+    });
   }
 
   Future<void> _tryVoice(Map<String, dynamic> t) async {
@@ -74,7 +86,8 @@ class _TutorSelectionPageState extends State<TutorSelectionPage> {
     if (_playingId == t['id']) {
       await _player.stop(); setState(() => _playingId = null); return;
     }
-    await _player.play(UrlSource(url));
+    final freshUrl = url.contains('?') ? url : '$url?t=\${DateTime.now().millisecondsSinceEpoch}';
+      await _player.play(UrlSource(freshUrl));
     setState(() => _playingId = t['id'] as String?);
     _player.onPlayerComplete.listen((_) {
       if (mounted) setState(() => _playingId = null);
@@ -84,10 +97,9 @@ class _TutorSelectionPageState extends State<TutorSelectionPage> {
   void _select(Map<String, dynamic> t) {
     final locked = t['isPremium'] == true && !_isPremium;
     if (locked) { Navigator.pushNamed(context, '/premium'); return; }
-    Navigator.pushNamed(context, '/practice', arguments: {
-      'tutorId': t['id'],
-      'lessonId': widget.lessonId.isEmpty ? 'demo_lesson' : widget.lessonId,
+    Navigator.pushNamed(context, '/lessons', arguments: {
       'languageId': widget.languageId,
+      'tutorId': t['id'] as String? ?? '',
     });
   }
 
@@ -95,7 +107,6 @@ class _TutorSelectionPageState extends State<TutorSelectionPage> {
     SnackBar(content: Text(m), backgroundColor: AppColors.primary));
 
   @override
-  void dispose() { _player.dispose(); super.dispose(); }
 
   @override
   Widget build(BuildContext context) {
@@ -124,7 +135,7 @@ class _TutorSelectionPageState extends State<TutorSelectionPage> {
                     shrinkWrap: true,
                     physics: const NeverScrollableScrollPhysics(),
                     gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: 2, childAspectRatio: 0.65,
+                      crossAxisCount: 2, childAspectRatio: 0.62,
                       crossAxisSpacing: 10, mainAxisSpacing: 10,
                     ),
                     itemCount: _tutors.length,
@@ -170,7 +181,7 @@ class _TutorCard extends StatelessWidget {
         // Photo
         Stack(children: [
           Container(
-            height: 130, width: double.infinity,
+            height: 120, width: double.infinity,
             decoration: const BoxDecoration(
               color: Color(0xFFE8F5E9),
               borderRadius: BorderRadius.only(
@@ -180,8 +191,13 @@ class _TutorCard extends StatelessWidget {
                 ? ClipRRect(
                     borderRadius: const BorderRadius.only(
                       topLeft: Radius.circular(12), topRight: Radius.circular(12)),
-                    child: Image.network(tutor['photoUrl'], fit: BoxFit.cover,
-                      errorBuilder: (_, __, ___) => const Center(
+                    child: CachedNetworkImage(
+                      imageUrl: tutor['photoUrl'] as String,
+                      cacheKey: '${tutor['photoUrl']}_${tutor['updatedAt'] ?? ''}',
+                      fit: BoxFit.cover,
+                      placeholder: (_, __) => const Center(
+                        child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.primary)),
+                      errorWidget: (_, __, ___) => const Center(
                         child: Icon(Icons.person, size: 60, color: AppColors.primaryLight))))
                 : const Center(child: Icon(Icons.person, size: 60, color: AppColors.primaryLight)),
           ),
@@ -203,14 +219,14 @@ class _TutorCard extends StatelessWidget {
           Text(tutor['name'] as String? ?? '',
             style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700,
               color: AppColors.text, fontFamily: 'NotoSans')),
-          const SizedBox(height: 2),
+          const SizedBox(height: 1),
           Row(children: [
             Text(tutor['flag'] as String? ?? '🌐', style: const TextStyle(fontSize: 12)),
             const SizedBox(width: 4),
             Text('${tutor['language']} | ${tutor['gender']}',
               style: const TextStyle(fontSize: 11, color: AppColors.textHint, fontFamily: 'NotoSans')),
           ]),
-          const SizedBox(height: 4),
+          const SizedBox(height: 3),
           Row(children: [
             const Icon(Icons.volume_up, size: 12, color: AppColors.primary),
             const SizedBox(width: 3),
@@ -221,7 +237,7 @@ class _TutorCard extends StatelessWidget {
         ])),
         // Buttons
         Padding(padding: const EdgeInsets.fromLTRB(8, 8, 8, 8), child: Column(children: [
-          SizedBox(width: double.infinity, height: 32, child: OutlinedButton.icon(
+          SizedBox(width: double.infinity, height: 30, child: OutlinedButton.icon(
             onPressed: onTryVoice,
             icon: Icon(isPlaying ? Icons.pause : Icons.headphones, size: 13, color: AppColors.primary),
             label: Text(isPlaying ? 'หยุดฟัง' : 'ทดลองฟังเสียง',
@@ -232,8 +248,8 @@ class _TutorCard extends StatelessWidget {
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
             ),
           )),
-          const SizedBox(height: 5),
-          SizedBox(width: double.infinity, height: 32, child: ElevatedButton(
+          const SizedBox(height: 4),
+          SizedBox(width: double.infinity, height: 30, child: ElevatedButton(
             onPressed: onSelect,
             style: ElevatedButton.styleFrom(
               backgroundColor: AppColors.primary,

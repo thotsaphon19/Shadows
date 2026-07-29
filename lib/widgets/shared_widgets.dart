@@ -60,7 +60,7 @@ class ShadowsAppBar extends StatelessWidget implements PreferredSizeWidget {
       child: SafeArea(bottom: false, child: SizedBox(
         height: 60,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
+          padding: const EdgeInsets.symmetric(horizontal: 12),
           child: Row(children: [
             if (showBack) ...[
               GestureDetector(
@@ -80,41 +80,43 @@ class ShadowsAppBar extends StatelessWidget implements PreferredSizeWidget {
             const ShadowsLogo(),
             const Spacer(),
             // Language button
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-              decoration: BoxDecoration(
-                border: Border.all(color: AppColors.border),
-                borderRadius: BorderRadius.circular(20),
-                color: AppColors.white,
+            GestureDetector(
+              onTap: () {},
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                decoration: BoxDecoration(
+                  border: Border.all(color: AppColors.border),
+                  borderRadius: BorderRadius.circular(20),
+                  color: AppColors.white,
+                ),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  const Icon(Icons.language, size: 14, color: AppColors.textSub),
+                  const SizedBox(width: 3),
+                  Text(language,
+                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600,
+                      color: AppColors.text, fontFamily: 'NotoSans'),
+                  ),
+                  const SizedBox(width: 2),
+                  const Icon(Icons.keyboard_arrow_down, size: 13, color: AppColors.text),
+                ]),
               ),
-              child: Row(mainAxisSize: MainAxisSize.min, children: [
-                const Icon(Icons.language, size: 15, color: AppColors.textSub),
-                const SizedBox(width: 4),
-                Text(language, style: const TextStyle(
-                  fontSize: 13, fontWeight: FontWeight.w600,
-                  color: AppColors.text, fontFamily: 'NotoSans',
-                )),
-                const SizedBox(width: 2),
-                const Icon(Icons.keyboard_arrow_down, size: 14, color: AppColors.text),
-              ]),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: 6),
+            // Member button
             GestureDetector(
               onTap: onProfile ?? () => Navigator.pushNamed(context, '/profile'),
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                 decoration: BoxDecoration(
                   border: Border.all(color: AppColors.border),
                   borderRadius: BorderRadius.circular(20),
                   color: AppColors.white,
                 ),
                 child: const Row(mainAxisSize: MainAxisSize.min, children: [
-                  Icon(Icons.person_outline, size: 16, color: AppColors.primary),
-                  SizedBox(width: 4),
-                  Text('Member', style: TextStyle(
-                    fontSize: 13, fontWeight: FontWeight.w600,
-                    color: AppColors.primary, fontFamily: 'NotoSans',
-                  )),
+                  Icon(Icons.person_outline, size: 15, color: AppColors.primary),
+                  SizedBox(width: 3),
+                  Text('Member', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600,
+                    color: AppColors.primary, fontFamily: 'NotoSans')),
                 ]),
               ),
             ),
@@ -401,11 +403,12 @@ class StatBox extends StatelessWidget {
 class LanguageCard extends StatelessWidget {
   final String flag, name, totalHours, weeklyInfo, learners;
   final VoidCallback? onTap;
+  final VoidCallback? onLearnersTap;
 
   const LanguageCard({
     super.key, required this.flag, required this.name,
     required this.totalHours, required this.weeklyInfo,
-    required this.learners, this.onTap,
+    required this.learners, this.onTap, this.onLearnersTap,
   });
 
   @override
@@ -439,20 +442,23 @@ class LanguageCard extends StatelessWidget {
           Text(weeklyInfo, style: AppText.tiny),
         ]),
         const SizedBox(width: 8),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-          decoration: BoxDecoration(
-            color: AppColors.surface50,
-            borderRadius: BorderRadius.circular(20),
+        GestureDetector(
+          onTap: onLearnersTap,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+            decoration: BoxDecoration(
+              color: AppColors.surface50,
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              const Icon(Icons.group, size: 13, color: AppColors.primaryMid),
+              const SizedBox(width: 3),
+              Text(learners, style: const TextStyle(
+                fontSize: 11, fontWeight: FontWeight.w600,
+                color: AppColors.primaryMid, fontFamily: 'NotoSans',
+              )),
+            ]),
           ),
-          child: Row(mainAxisSize: MainAxisSize.min, children: [
-            const Icon(Icons.group, size: 13, color: AppColors.primaryMid),
-            const SizedBox(width: 3),
-            Text(learners, style: const TextStyle(
-              fontSize: 11, fontWeight: FontWeight.w600,
-              color: AppColors.primaryMid, fontFamily: 'NotoSans',
-            )),
-          ]),
         ),
         const SizedBox(width: 4),
         const Icon(Icons.chevron_right, size: 16, color: AppColors.textHint),

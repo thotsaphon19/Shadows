@@ -5,8 +5,12 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'theme/app_theme.dart';
 import 'pages/login_page.dart';
+import 'services/app_image_service.dart';
+import 'services/cloudflare_r2_service.dart';
+import 'services/tts_service.dart';
 import 'pages/home_page.dart';
 import 'pages/lessons_page.dart';
+import 'pages/lesson_content_page.dart';
 import 'pages/tutor_selection_page.dart';
 import 'pages/practice_page.dart';
 import 'pages/leaderboard_page.dart';
@@ -19,6 +23,9 @@ Future<void> main() async {
   SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
   SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle.dark);
   await Firebase.initializeApp();
+  await AppImageService.init();
+  await R2Service.init();
+  await TtsService.init();
   runApp(const ShadowsApp());
 }
 
@@ -44,20 +51,31 @@ class ShadowsApp extends StatelessWidget {
         return _slide(const HomePage());
       case '/lessons':
         final a = s.arguments as Map<String, dynamic>?;
-        return _slide(LessonsPage(languageId: a?['languageId'] ?? 'English'));
+        return _slide(LessonsPage(
+          languageId: a?['languageId'] ?? 'English',
+          tutorId:    a?['tutorId']    ?? '',
+        ));
       case '/tutors':
         final a = s.arguments as Map<String, dynamic>?;
         return _slide(TutorSelectionPage(
-          category: a?['category'] ?? '',
-          wordCount: a?['wordCount'] ?? 50,
           languageId: a?['languageId'] ?? 'English',
         ));
+      case '/lesson-content':
+        final a = s.arguments as Map<String, dynamic>? ?? {};
+        return _slide(LessonContentPage(
+          category:     a['category']   as String? ?? '',
+          categoryIcon: a['icon']       as String? ?? '📚',
+          languageId:   a['languageId'] as String? ?? 'English',
+          tutorId:      a['tutorId']    as String? ?? '',
+          wordCount:    a['wordCount']  as int?    ?? 50,
+        ));
       case '/practice':
-        final a = s.arguments as Map<String, dynamic>;
+        final a = s.arguments as Map<String, dynamic>? ?? {};
         return _slide(PracticePage(
-          tutorId: a['tutorId'],
-          lessonId: a['lessonId'],
-          languageId: a['languageId'],
+          tutorId:    a['tutorId']    as String? ?? 'tutor_01',
+          lessonId:   a['lessonId']   as String? ?? 'lesson_01',
+          languageId: a['languageId'] as String? ?? 'English',
+          lessonText: a['lessonText'] as String? ?? '',
         ));
       case '/leaderboard':
         final a = s.arguments as Map<String, dynamic>?;

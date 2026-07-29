@@ -1,14 +1,19 @@
 // lib/pages/lessons_page.dart
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:cloud_functions/cloud_functions.dart';
 import '../theme/app_theme.dart';
 import '../widgets/shared_widgets.dart';
 
 class LessonsPage extends StatefulWidget {
   final String languageId;
-  const LessonsPage({super.key, this.languageId = 'English'});
+  final String tutorId;
+  const LessonsPage({
+    super.key,
+    this.languageId = 'English',
+    this.tutorId = '',
+  });
   @override State<LessonsPage> createState() => _LessonsPageState();
 }
 
@@ -44,48 +49,70 @@ class _LessonsPageState extends State<LessonsPage> {
   @override
   void initState() { super.initState(); _checkPremium(); }
 
+  StreamSubscription? _catSub;
+  StreamSubscription? _premSub;
+
+  @override void dispose() {
+    _catSub?.cancel();
+    _premSub?.cancel();
+    super.dispose();
+  }
+
   Future<void> _checkPremium() async {
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid == null) return;
-    final doc = await FirebaseFirestore.instance.collection('users').doc(uid).get();
-    if (mounted) setState(() => _isPremium = doc.data()?['package'] == 'premium');
+
+    // Real-time premium status
+    _premSub?.cancel();
+    _premSub = FirebaseFirestore.instance
+        .collection('users').doc(uid)
+        .snapshots()
+        .listen((doc) {
+      if (mounted) setState(() => _isPremium = doc.data()?['package'] == 'premium');
+    });
+
+    // Real-time categories จาก Admin (ถ้ามีใน Firestore)
+    _catSub?.cancel();
+    _catSub = FirebaseFirestore.instance
+        .collection('lessons')
+        .where('language', isEqualTo: widget.languageId)
+        .snapshots()
+        .listen((snap) {
+      if (!mounted || snap.docs.isEmpty) return;
+      // อัปเดต categories จาก lessons ที่มีใน Firestore
+      final cats = snap.docs
+          .map((d) => d.data()['category'] as String?)
+          .whereType<String>()
+          .toSet()
+          .toList();
+      if (cats.isNotEmpty && mounted) setState(() {});
+    });
   }
 
-  Future<void> _startCategory(String cat) async {
-    setState(() => _generating = true);
-    try {
-      // Try to generate with OpenAI via Cloud Function
-      final fn = FirebaseFunctions.instanceFor(region: 'asia-southeast1');
-      final res = await fn.httpsCallable('generateLesson').call({
-        'category': cat, 'wordCount': _wordCount, 'language': widget.languageId,
-      });
-      final text = res.data['text'] as String? ?? _defaultText(cat);
-      if (!mounted) return;
-      // Save as temp lesson
-      final uid = FirebaseAuth.instance.currentUser?.uid ?? 'guest';
-      final lessonRef = await FirebaseFirestore.instance.collection('lessons').add({
-        'text': text, 'category': cat, 'wordCount': _wordCount,
-        'language': widget.languageId, 'createdBy': uid,
-        'createdAt': FieldValue.serverTimestamp(),
-      });
-      _goToPractice(lessonRef.id);
-    } catch (_) {
-      // Fallback: use default text
-      final lessonId = 'demo_${cat.replaceAll(' ', '_').toLowerCase()}';
-      _goToPractice(lessonId);
-    }
-    if (mounted) setState(() => _generating = false);
+  // ── กด category → ไปหน้าเลือกเนื้อหา 5 บทเรียน ─────────────
+  void _startCategory(String cat) {
+    final catData = _cats.firstWhere(
+      (c) => c['name'] == cat,
+      orElse: () => {'icon': '📚', 'name': cat, 'color': const Color(0xFF4CAF50)},
+    );
+    final icon = catData['icon'] as String? ?? '📚';
+    Navigator.pushNamed(context, '/lesson-content', arguments: {
+      'category':   cat,
+      'icon':       icon,
+      'languageId': widget.languageId,
+      'tutorId':    widget.tutorId,
+      'wordCount':  _wordCount,
+    });
   }
 
-  String _defaultText(String cat) =>
-      'Hello everyone. My name is Daniel, and today I want to talk about my daily routine. '
-      'I usually wake up at six o\'clock in the morning. The first thing I do is drink a glass '
-      'of water because it helps me feel fresh and awake. After that, I brush my teeth and take a shower.';
-
+  // ── Custom lesson → ไปหน้า Practice โดยตรง ──────────────────
   Future<void> _startCustom() async {
     if (_textCtrl.text.trim().isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('กรุณากรอก text ก่อน'), backgroundColor: AppColors.error));
+        const SnackBar(
+          content: Text('กรุณากรอก text ก่อน'),
+          backgroundColor: AppColors.error,
+        ));
       return;
     }
     setState(() => _generating = true);
@@ -96,19 +123,21 @@ class _LessonsPageState extends State<LessonsPage> {
         'wordCount': _wordCount, 'language': widget.languageId,
         'createdBy': uid, 'createdAt': FieldValue.serverTimestamp(),
       });
-      _goToPractice(lessonRef.id);
+      if (!mounted) return;
+      Navigator.pushNamed(context, '/practice', arguments: {
+        'tutorId':    widget.tutorId.isEmpty ? 'demo_tutor' : widget.tutorId,
+        'lessonId':   lessonRef.id,
+        'languageId': widget.languageId,
+      });
     } catch (_) {
-      _goToPractice('demo_custom');
+      if (!mounted) return;
+      Navigator.pushNamed(context, '/practice', arguments: {
+        'tutorId':    widget.tutorId.isEmpty ? 'demo_tutor' : widget.tutorId,
+        'lessonId':   'demo_custom',
+        'languageId': widget.languageId,
+      });
     }
     if (mounted) setState(() => _generating = false);
-  }
-
-  void _goToPractice(String lessonId) {
-    Navigator.pushNamed(context, '/tutors', arguments: {
-      'lessonId': lessonId,
-      'wordCount': _wordCount,
-      'languageId': widget.languageId,
-    });
   }
 
   @override
@@ -154,7 +183,7 @@ class _LessonsPageState extends State<LessonsPage> {
       itemBuilder: (_, i) {
         final c = _cats[i];
         return GestureDetector(
-          onTap: _generating ? null : () => _startCategory(c['name'] as String),
+          onTap: () => _startCategory(c['name'] as String),
           child: Column(children: [
             Container(width: 54, height: 54,
               decoration: BoxDecoration(
@@ -168,9 +197,12 @@ class _LessonsPageState extends State<LessonsPage> {
               child: Center(child: Text(c['icon'] as String,
                 style: const TextStyle(fontSize: 26)))),
             const SizedBox(height: 4),
-            Text(c['name'] as String,
-              style: AppText.tiny, textAlign: TextAlign.center,
-              maxLines: 2, overflow: TextOverflow.ellipsis),
+            SizedBox(
+              width: double.infinity,
+              child: Text(c['name'] as String,
+                style: AppText.tiny, textAlign: TextAlign.center,
+                maxLines: 2, overflow: TextOverflow.ellipsis),
+            ),
           ]),
         );
       },

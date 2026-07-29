@@ -34,7 +34,16 @@ class _PremiumPageState extends State<PremiumPage> {
         _buildPlans(),
         Padding(padding: const EdgeInsets.fromLTRB(14, 0, 14, 14), child: GreenButton(
           text: 'Subscribe Now', isLoading: _loading,
-          onTap: () => setState(() => _loading = true),
+          onTap: () {
+          setState(() => _loading = true);
+          Future.delayed(const Duration(seconds: 2), () {
+            if (mounted) {
+              setState(() => _loading = false);
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('กำลังเปิด Payment... (RevenueCat integration needed)')));
+            }
+          });
+        },
         )),
         _buildFeatureTable(),
         _buildGuarantees(),
