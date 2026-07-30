@@ -143,7 +143,6 @@ class _PracticePageState extends State<PracticePage>
   CameraController? _cameraController;
   bool _cameraOn = false;        // ผู้เรียนเลือกเปิด/ปิดกล้องเอง (default ปิด → ใช้ Avatar)
   bool _cameraBusy = false;      // กันกดรัวตอนกำลังเปิด/ปิดกล้อง
-  String? _currentVideoPath;     // path วิดีโอที่กำลังบันทึกอยู่
 
   // ── Learner Avatar (ใช้แทนกล้องตอนไม่เปิดกล้อง) ──
   String? _learnerAvatarId;
@@ -487,7 +486,6 @@ class _PracticePageState extends State<PracticePage>
     );
 
     // ถ้าเปิดกล้องไว้ → เริ่มบันทึกวิดีโอไปพร้อมกัน (ภาพผู้เรียนตอน shadowing)
-    _currentVideoPath = null;
     if (_cameraOn && _cameraController?.value.isInitialized == true) {
       try {
         await _cameraController!.startVideoRecording();
@@ -537,7 +535,6 @@ class _PracticePageState extends State<PracticePage>
         debugPrint('stopVideoRecording error: $e');
       }
     }
-    _currentVideoPath = videoPath;
 
     final audioPath = stoppedPath ?? _currentRecordingPath;
     final refText   = _lesson['text'] as String? ?? '';
@@ -552,7 +549,6 @@ class _PracticePageState extends State<PracticePage>
       final muxed = await _muxAudioIntoVideo(videoPath, audioPath);
       if (muxed != null) {
         videoPath = muxed;
-        _currentVideoPath = muxed;
       }
       // ถ้ามุกซ์ไม่สำเร็จ ยังเก็บวิดีโอมิวท์เดิมไว้ใช้ได้ตามปกติ (fallback)
     }
