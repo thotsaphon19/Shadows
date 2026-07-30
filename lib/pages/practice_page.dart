@@ -30,12 +30,17 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_sound/flutter_sound.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:video_player/video_player.dart';
+import 'package:camera/camera.dart';
+import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:http/http.dart' as http;
 import '../theme/app_theme.dart';
 import '../widgets/shared_widgets.dart';
 import '../services/tts_service.dart';
 import '../services/pronunciation_scoring_service.dart';
+import '../services/cloudflare_r2_service.dart';
 
 // ─── Color Constants ────────────────────────────────────────
 const _kGreen = Color(0xFF2E7D32);
@@ -61,6 +66,7 @@ class RecordingItem {
   final bool    isCompleted;
   final String? audioUrl;      // URL เสียงจาก R2 หรือ local path
   final String? localPath;     // path เสียงในเครื่อง
+  final String? videoLocalPath;// path วิดีโอ (กล้อง) ในเครื่อง — ถ้าเปิดกล้องตอนฝึก
   final String? dateLabel;
   final String? duration;
   final bool    isLocked;
@@ -72,6 +78,7 @@ class RecordingItem {
     this.isCompleted = false,
     this.audioUrl,
     this.localPath,
+    this.videoLocalPath,
     this.dateLabel,
     this.duration,
     this.isLocked = false,
@@ -130,6 +137,17 @@ class _PracticePageState extends State<PracticePage>
   String? _currentRecordingPath;
   Timer? _recordingTimer;
   int _recordingSeconds = 0;
+
+  // ── Camera (เปิดกล้องบันทึกวิดีโอตอนฝึก) ──
+  List<CameraDescription> _cameras = [];
+  CameraController? _cameraController;
+  bool _cameraOn = false;        // ผู้เรียนเลือกเปิด/ปิดกล้องเอง (default ปิด → ใช้ Avatar)
+  bool _cameraBusy = false;      // กันกดรัวตอนกำลังเปิด/ปิดกล้อง
+  String? _currentVideoPath;     // path วิดีโอที่กำลังบันทึกอยู่
+
+  // ── Learner Avatar (ใช้แทนกล้องตอนไม่เปิดกล้อง) ──
+  String? _learnerAvatarId;
+  String? _learnerAvatarUrl;
 
   // ── Score ──
   int _pronunciationScore = 88;
@@ -228,6 +246,8 @@ class _PracticePageState extends State<PracticePage>
         final userDoc = await FirebaseFirestore.instance
             .collection('users').doc(uid).get();
         _isPremium = userDoc.data()?['package'] == 'premium';
+        _learnerAvatarId  = userDoc.data()?['avatarId']  as String?;
+        _learnerAvatarUrl = userDoc.data()?['avatarUrl'] as String?;
 
         // Load recordings
         final recsSnap = await FirebaseFirestore.instance
@@ -242,6 +262,7 @@ class _PracticePageState extends State<PracticePage>
           isCompleted: true,
           audioUrl:  e.value.data()['audioUrl'] as String?,
           localPath: e.value.data()['audioLocalPath'] as String?,
+          videoLocalPath: e.value.data()['videoLocalPath'] as String?,
           dateLabel: _formatDate(e.value.data()['createdAt']),
           duration:  _formatDuration((e.value.data()['durationSeconds'] as num?)?.toInt() ?? 0),
           score:     (e.value.data()['pronunciationScore'] as num?)?.toInt() ?? 0,
@@ -355,6 +376,95 @@ class _PracticePageState extends State<PracticePage>
     }
   }
 
+  // ── กล้อง (สำหรับบันทึกวิดีโอตอนฝึกพูดตาม) ──────────────────
+  Future<void> _toggleCamera() async {
+    if (_cameraBusy) return;
+    setState(() => _cameraBusy = true);
+    try {
+      if (_cameraOn) {
+        await _disposeCamera();
+        setState(() => _cameraOn = false);
+      } else {
+        final ok = await _initCamera();
+        if (ok) setState(() => _cameraOn = true);
+      }
+    } finally {
+      if (mounted) setState(() => _cameraBusy = false);
+    }
+  }
+
+  Future<bool> _initCamera() async {
+    final camOk = await Permission.camera.request();
+    if (!camOk.isGranted) {
+      _showSnack('ต้องการสิทธิ์กล้องเพื่อบันทึกวิดีโอ', isError: true);
+      return false;
+    }
+    try {
+      if (_cameras.isEmpty) _cameras = await availableCameras();
+      if (_cameras.isEmpty) {
+        _showSnack('ไม่พบกล้องในอุปกรณ์นี้', isError: true);
+        return false;
+      }
+      final front = _cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.front,
+        orElse: () => _cameras.first,
+      );
+      // enableAudio: false — เสียงบันทึกแยกผ่าน flutter_sound + speech_to_text อยู่แล้ว
+      // (เปิดไมค์ 2 ทางพร้อมกันอาจชนกันบนบางอุปกรณ์/iOS)
+      final controller = CameraController(
+        front, ResolutionPreset.medium,
+        enableAudio: false,
+      );
+      await controller.initialize();
+      if (!mounted) { await controller.dispose(); return false; }
+      _cameraController = controller;
+      return true;
+    } catch (e) {
+      _showSnack('เปิดกล้องไม่สำเร็จ: $e', isError: true);
+      return false;
+    }
+  }
+
+  Future<void> _disposeCamera() async {
+    final c = _cameraController;
+    _cameraController = null;
+    if (c != null && c.value.isRecordingVideo) {
+      try { await c.stopVideoRecording(); } catch (_) {}
+    }
+    await c?.dispose();
+  }
+
+  // ── มุกซ์เสียง (WAV จากการอัดคู่ขนาน) เข้ากับวิดีโอกล้อง (มิวท์) ──
+  // วิดีโอกล้องอัดแบบ enableAudio:false (กันชนกับ mic ที่ใช้ STT ให้คะแนน)
+  // พอหยุดอัดเสร็จแล้วค่อยเอาไฟล์เสียงจริงมาใส่ทีหลัง ได้วิดีโอที่มีเสียงพูดสมบูรณ์
+  Future<String?> _muxAudioIntoVideo(String videoPath, String audioPath) async {
+    try {
+      final dir = await getTemporaryDirectory();
+      final outPath = '${dir.path}/shadow_${DateTime.now().millisecondsSinceEpoch}.mp4';
+
+      // -c:v copy = ไม่ re-encode วิดีโอ (เร็ว ไม่เสียคุณภาพ)
+      // -c:a aac  = แปลงเสียง WAV เป็น AAC ให้เข้ากับ container mp4
+      // -shortest = ตัดให้เท่าความยาวที่สั้นกว่า กันกรณีเริ่ม/หยุดคลาดกันเล็กน้อย
+      final cmd = '-y -i "$videoPath" -i "$audioPath" '
+          '-c:v copy -c:a aac -b:a 128k '
+          '-map 0:v:0 -map 1:a:0 -shortest "$outPath"';
+
+      final session = await FFmpegKit.execute(cmd);
+      final rc = await session.getReturnCode();
+
+      if (ReturnCode.isSuccess(rc)) {
+        // ลบวิดีโอมิวท์ต้นฉบับทิ้ง ประหยัดพื้นที่เครื่อง
+        try { await File(videoPath).delete(); } catch (_) {}
+        return outPath;
+      }
+      debugPrint('mux failed, logs: ${await session.getFailStackTrace()}');
+      return null;
+    } catch (e) {
+      debugPrint('mux error: $e');
+      return null;
+    }
+  }
+
   Future<void> _startRecording() async {
     // ขอสิทธิ์ microphone
     final micOk = await Permission.microphone.request();
@@ -375,6 +485,16 @@ class _PracticePageState extends State<PracticePage>
       sampleRate: 16000,
       numChannels: 1,
     );
+
+    // ถ้าเปิดกล้องไว้ → เริ่มบันทึกวิดีโอไปพร้อมกัน (ภาพผู้เรียนตอน shadowing)
+    _currentVideoPath = null;
+    if (_cameraOn && _cameraController?.value.isInitialized == true) {
+      try {
+        await _cameraController!.startVideoRecording();
+      } catch (e) {
+        debugPrint('startVideoRecording error: $e');
+      }
+    }
 
     // เริ่ม STT พร้อมกัน
     final sttOk = await PronunciationScoringService.init();
@@ -407,11 +527,34 @@ class _PracticePageState extends State<PracticePage>
     final stoppedPath = await _recorder.stopRecorder();
     await PronunciationScoringService.stop();
 
+    // หยุดบันทึกวิดีโอ (ถ้าเปิดกล้องไว้)
+    String? videoPath;
+    if (_cameraController?.value.isRecordingVideo == true) {
+      try {
+        final file = await _cameraController!.stopVideoRecording();
+        videoPath = file.path;
+      } catch (e) {
+        debugPrint('stopVideoRecording error: $e');
+      }
+    }
+    _currentVideoPath = videoPath;
+
     final audioPath = stoppedPath ?? _currentRecordingPath;
     final refText   = _lesson['text'] as String? ?? '';
 
     if (audioPath == null || refText.isEmpty) {
       _showSnack('ไม่พบไฟล์เสียง', isError: true); return;
+    }
+
+    // ถ้ามีวิดีโอ (เปิดกล้องไว้) → ใส่เสียงจริงเข้าไปในวิดีโอ (แทนที่จะเป็นวิดีโอมิวท์)
+    if (videoPath != null) {
+      _showSnack('⏳ กำลังรวมเสียงเข้าวิดีโอ...');
+      final muxed = await _muxAudioIntoVideo(videoPath, audioPath);
+      if (muxed != null) {
+        videoPath = muxed;
+        _currentVideoPath = muxed;
+      }
+      // ถ้ามุกซ์ไม่สำเร็จ ยังเก็บวิดีโอมิวท์เดิมไว้ใช้ได้ตามปกติ (fallback)
     }
 
     _showSnack('⏳ กำลังประเมินการออกเสียง...');
@@ -427,7 +570,7 @@ class _PracticePageState extends State<PracticePage>
     _scoreController.forward(from: 0);
 
     // บันทึกลง Firestore + อัปโหลดเสียง
-    await _saveRecordingResult(result, audioPath: audioPath);
+    await _saveRecordingResult(result, audioPath: audioPath, videoPath: videoPath);
     _showScoreSheet(result);
   }
 
@@ -446,12 +589,13 @@ class _PracticePageState extends State<PracticePage>
 
   // บันทึกผลลง Firestore
   Future<void> _saveRecordingResult(PronunciationResult result,
-      {String? audioPath}) async {
+      {String? audioPath, String? videoPath}) async {
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid == null) return;
 
     // เก็บ local path ไว้เล่น/ดาวน์โหลดในเครื่อง
     String? finalAudioPath = audioPath;
+    String? finalVideoPath = videoPath;
 
     try {
       final docRef = await FirebaseFirestore.instance
@@ -469,6 +613,8 @@ class _PracticePageState extends State<PracticePage>
         'fluencyScore':       result.fluencyScore,
         'durationSeconds':    _recordingSeconds,
         'audioLocalPath':     finalAudioPath ?? '',
+        'videoLocalPath':     finalVideoPath ?? '',
+        'hasVideo':           finalVideoPath != null,
         'isCompleted':        true,
         'createdAt':          FieldValue.serverTimestamp(),
       });
@@ -485,6 +631,7 @@ class _PracticePageState extends State<PracticePage>
         number:      _recordings.where((r) => r.isCompleted).length + 1,
         isCompleted: true,
         localPath:   finalAudioPath,
+        videoLocalPath: finalVideoPath,
         dateLabel:   _formatDate(null),
         duration:    _formatDuration(_recordingSeconds),
         score:       result.overallScore,
@@ -534,25 +681,48 @@ class _PracticePageState extends State<PracticePage>
     }
   }
 
+  // ── เล่นวิดีโอที่บันทึกไว้ตอนฝึก + เทียบกับวิดีโอครู AI ─────────
+  void _playRecordingVideo(RecordingItem rec) {
+    final path = rec.videoLocalPath;
+    if (path == null || !File(path).existsSync()) {
+      _showSnack('ไม่พบไฟล์วิดีโอ (อาจถูกลบจากเครื่องแล้ว)', isError: true);
+      return;
+    }
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (_) => _VideoCompareSheet(
+        learnerVideoPath: path,
+        tutorVideoUrl: _tutor['videoUrl'] as String?,
+        tutorName: _tutor['name'] as String? ?? 'AI Tutor',
+        score: rec.score,
+      ),
+    );
+  }
+
   // ── ดาวน์โหลดเสียงไปเครื่อง ─────────────────────────────────
   Future<void> _downloadRecording(RecordingItem rec) async {
+    // ถ้ามีวิดีโอ (เปิดกล้อง + มุกซ์เสียงแล้ว) → ดาวน์โหลดวิดีโอเป็นหลัก
+    if (rec.videoLocalPath != null && File(rec.videoLocalPath!).existsSync()) {
+      await _downloadLocalFile(
+        rec.videoLocalPath!,
+        'shadows_rec_${rec.number.toString().padLeft(3, "0")}.mp4',
+      );
+      return;
+    }
+
     if (rec.localPath != null && File(rec.localPath!).existsSync()) {
-      // มีไฟล์ในเครื่องแล้ว → copy ไป Downloads
-      try {
-        final dlDir   = Directory('/storage/emulated/0/Download');
-        final exists  = await dlDir.exists();
-        final saveDir = exists ? dlDir : await getApplicationDocumentsDirectory();
-        final fileName = 'shadows_rec_${rec.number.toString().padLeft(3, "0")}.wav';
-        final savePath = '${saveDir.path}/$fileName';
-        await File(rec.localPath!).copy(savePath);
-        _showSnack('✅ บันทึกที่ $fileName');
-      } catch (e) {
-        _showSnack('ดาวน์โหลดไม่สำเร็จ: $e', isError: true);
-      }
+      // มีไฟล์เสียงในเครื่องแล้ว → copy ไป Downloads
+      await _downloadLocalFile(
+        rec.localPath!,
+        'shadows_rec_${rec.number.toString().padLeft(3, "0")}.wav',
+      );
       return;
     }
     if (rec.audioUrl == null) {
-      _showSnack('ไม่พบไฟล์เสียง', isError: true);
+      _showSnack('ไม่พบไฟล์เสียง/วิดีโอ', isError: true);
       return;
     }
     // ดาวน์โหลดจาก URL
@@ -571,8 +741,31 @@ class _PracticePageState extends State<PracticePage>
     }
   }
 
+  // คัดลอกไฟล์ในเครื่อง (เสียงหรือวิดีโอ) ไปโฟลเดอร์ Downloads
+  Future<void> _downloadLocalFile(String sourcePath, String fileName) async {
+    try {
+      final dlDir   = Directory('/storage/emulated/0/Download');
+      final exists  = await dlDir.exists();
+      final saveDir = exists ? dlDir : await getApplicationDocumentsDirectory();
+      final savePath = '${saveDir.path}/$fileName';
+      await File(sourcePath).copy(savePath);
+      _showSnack('✅ บันทึกที่ $fileName');
+    } catch (e) {
+      _showSnack('ดาวน์โหลดไม่สำเร็จ: $e', isError: true);
+    }
+  }
+
   // ── แชรเสียง ────────────────────────────────────────────────
   Future<void> _shareRecording(RecordingItem rec) async {
+    // ถ้ามีวิดีโอ (เปิดกล้อง + มุกซ์เสียงแล้ว) → แชร์วิดีโอเป็นหลัก
+    // เหมาะกับแพลตฟอร์มที่รองรับการแชร์ (TikTok/Reels, YouTube, Facebook, LINE ฯลฯ)
+    String? videoSharePath = rec.videoLocalPath;
+    if (videoSharePath != null && File(videoSharePath).existsSync()) {
+      await _shareFile(videoSharePath, mimeType: 'video/mp4', rec: rec);
+      return;
+    }
+
+    // ไม่มีวิดีโอ → แชร์ไฟล์เสียงแทน (ตามเดิม)
     String? sharePath = rec.localPath;
     if (sharePath == null || !File(sharePath).existsSync()) {
       if (rec.audioUrl != null) {
@@ -586,15 +779,20 @@ class _PracticePageState extends State<PracticePage>
         } catch (_) { sharePath = null; }
       }
     }
+    await _shareFile(sharePath, mimeType: 'audio/wav', rec: rec);
+  }
 
+  // ── เปิด share sheet ของระบบ (รองรับทุกแอปที่ลงทะเบียนรับไฟล์ตามชนิด) ──
+  // ผู้ใช้เลือกแพลตฟอร์มปลายทางเองจากรายการที่ระบบ/เครื่องกำหนดไว้ (ไม่ผูกกับแอปใดแอปหนึ่งตายตัว)
+  Future<void> _shareFile(String? path, {required String mimeType, required RecordingItem rec}) async {
     final scoreText = rec.score > 0 ? ' คะแนน ${rec.score}%' : '';
     final msg = '🎙️ ฝึกภาษาด้วย Shadows by yannawut!$scoreText\n'
         'บทเรียน: ${(_lesson['category'] ?? widget.lessonId)}\n'
         '#ShadowsApp #ฝึกพูดภาษาอังกฤษ';
 
-    if (sharePath != null && File(sharePath).existsSync()) {
+    if (path != null && File(path).existsSync()) {
       await Share.shareXFiles(
-        [XFile(sharePath, mimeType: 'audio/wav')],
+        [XFile(path, mimeType: mimeType)],
         text: msg,
       );
     } else {
@@ -682,6 +880,7 @@ class _PracticePageState extends State<PracticePage>
     _audioPlayer.dispose();
     _recSub?.cancel();
     _recorder.closeRecorder();  // flutter_sound: ไม่ต้อง await ใน dispose
+    _cameraController?.dispose();
     TtsService.dispose();
     _recordingTimer?.cancel();
     _waveController.dispose();
@@ -743,9 +942,34 @@ class _PracticePageState extends State<PracticePage>
       Positioned(top: 10, left: 12, child: _buildLabel('🇺🇸 AI Tutor', isLeft: true)),
       Positioned(top: 10, left: 0, right: 0, child: Center(child: _buildBrandBadge())),
       Positioned(top: 10, right: 12, child: _buildLabel('🇹🇭 Learner', isLeft: false)),
+      // ปุ่มเปิด/ปิดกล้อง (ฝั่งผู้เรียน) — ไม่เปิด = ใช้ Avatar แทน
+      Positioned(top: 44, right: 12, child: _buildCameraToggleButton()),
       // Waveform overlay at bottom
       Positioned(bottom: 0, left: 0, right: 0, child: _buildWaveformOverlay()),
     ]);
+  }
+
+  Widget _buildCameraToggleButton() {
+    return GestureDetector(
+      onTap: _cameraBusy ? null : _toggleCamera,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.55),
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          _cameraBusy
+            ? const SizedBox(width: 12, height: 12,
+                child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.white))
+            : Icon(_cameraOn ? Icons.videocam : Icons.videocam_off,
+                size: 14, color: Colors.white),
+          const SizedBox(width: 4),
+          Text(_cameraOn ? 'กล้องเปิด' : 'ใช้ Avatar',
+            style: const TextStyle(fontSize: 10, color: Colors.white, fontWeight: FontWeight.w600)),
+        ]),
+      ),
+    );
   }
 
   Widget _buildVideoContent() {
@@ -763,10 +987,16 @@ class _PracticePageState extends State<PracticePage>
           )),
           // Divider line
           Container(width: 2, color: Colors.black),
-          // Learner half
+          // Learner half — กล้องจริง (ถ้าเปิด) หรือ Avatar ของผู้เรียน
           Expanded(child: Container(
             color: const Color(0xFF3A2D2D),
-            child: const _TutorVideoPlaceholder(name: 'Learner', isMale: false),
+            child: _LearnerPanel(
+              name: 'Learner',
+              cameraOn: _cameraOn,
+              cameraController: _cameraController,
+              avatarId: _learnerAvatarId,
+              avatarUrl: _learnerAvatarUrl,
+            ),
           )),
         ]);
       case DisplayMode.tutorAvatar:
@@ -780,15 +1010,28 @@ class _PracticePageState extends State<PracticePage>
               isMale: true),
           )),
           Container(width: 2, color: Colors.black),
+          // โหมดนี้ตั้งใจโชว์ Avatar เสมอ (ไม่ใช้กล้อง) ตามชื่อโหมด
           Expanded(child: Container(
             color: const Color(0xFF1B2E1B),
-            child: const Center(child: _MascotAvatar()),
+            child: _LearnerPanel(
+              name: 'Avatar',
+              cameraOn: false,
+              cameraController: null,
+              avatarId: _learnerAvatarId,
+              avatarUrl: _learnerAvatarUrl,
+            ),
           )),
         ]);
       case DisplayMode.learnerOnly:
         return Container(
           color: const Color(0xFF3A2D2D),
-          child: const _TutorVideoPlaceholder(name: 'Learner', isMale: false),
+          child: _LearnerPanel(
+            name: 'Learner',
+            cameraOn: _cameraOn,
+            cameraController: _cameraController,
+            avatarId: _learnerAvatarId,
+            avatarUrl: _learnerAvatarUrl,
+          ),
         );
     }
   }
@@ -1283,6 +1526,17 @@ class _PracticePageState extends State<PracticePage>
                 child: const Icon(Icons.play_arrow, size: 14, color: Colors.white),
               ),
             ),
+            if (rec.videoLocalPath != null && rec.videoLocalPath!.isNotEmpty) ...[
+              const SizedBox(width: 6),
+              GestureDetector(
+                onTap: () => _playRecordingVideo(rec),
+                child: Container(
+                  width: 28, height: 28,
+                  decoration: const BoxDecoration(color: _kText, shape: BoxShape.circle),
+                  child: const Icon(Icons.videocam, size: 14, color: Colors.white),
+                ),
+              ),
+            ],
             const SizedBox(width: 6),
             Text(rec.duration ?? '', style: const TextStyle(fontSize: 11, color: _kHint)),
           ],
@@ -1347,6 +1601,11 @@ class _PracticePageState extends State<PracticePage>
   }
 
   Widget _buildBottomButtons() {
+    final completedList = _recordings.where((r) => r.isCompleted).toList();
+    final lastHasVideo = completedList.isNotEmpty &&
+        completedList.last.videoLocalPath != null &&
+        completedList.last.videoLocalPath!.isNotEmpty;
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(14, 4, 14, 4),
       child: Row(children: [
@@ -1361,8 +1620,8 @@ class _PracticePageState extends State<PracticePage>
             }
           },
           icon: const Icon(Icons.download_outlined, size: 17, color: _kText),
-          label: const Text('Download Audio',
-            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: _kText)),
+          label: Text(lastHasVideo ? 'Download Video' : 'Download Audio',
+            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: _kText)),
           style: OutlinedButton.styleFrom(
             padding: const EdgeInsets.symmetric(vertical: 14),
             side: const BorderSide(color: _kBorder, width: 1.5),
@@ -1766,7 +2025,9 @@ class _NavItem extends StatelessWidget {
 }
 
 // ─── Video Placeholders ──────────────────────────────────────
-class _TutorVideoPlaceholder extends StatelessWidget {
+// Tutor ฝั่งนี้เล่นวิดีโอ AI จาก HeyGen จริง (videoUrl จาก Firestore)
+// ถ้าไม่มีวิดีโอ (ยังไม่ได้สร้าง หรือ Tutor เก่าที่มีแต่รูป) จะ fallback ไปรูปนิ่งเหมือนเดิม
+class _TutorVideoPlaceholder extends StatefulWidget {
   final String  name;
   final bool    isMale;
   final String? photoUrl;
@@ -1779,22 +2040,89 @@ class _TutorVideoPlaceholder extends StatelessWidget {
   });
 
   @override
+  State<_TutorVideoPlaceholder> createState() => _TutorVideoPlaceholderState();
+}
+
+class _TutorVideoPlaceholderState extends State<_TutorVideoPlaceholder> {
+  VideoPlayerController? _controller;
+  bool _videoReady = false;
+  bool _videoFailed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _setupVideo();
+  }
+
+  @override
+  void didUpdateWidget(_TutorVideoPlaceholder old) {
+    super.didUpdateWidget(old);
+    // Admin แก้ Tutor/สร้างวิดีโอใหม่ระหว่างที่ผู้ใช้อยู่หน้านี้ → โหลดวิดีโอใหม่
+    if (old.videoUrl != widget.videoUrl) {
+      _disposeController();
+      _setupVideo();
+    }
+  }
+
+  void _setupVideo() {
+    final url = widget.videoUrl;
+    if (url == null || url.isEmpty) return;
+
+    final controller = VideoPlayerController.networkUrl(Uri.parse(url));
+    _controller = controller;
+    controller.initialize().then((_) {
+      if (!mounted) return;
+      controller
+        ..setLooping(true)
+        // เสียงพูดจริงมาจาก TtsService แยกต่างหาก (sync กับบทเรียน)
+        // ปิดเสียงในไฟล์วิดีโอเองเพื่อไม่ให้ซ้อนกับ TTS
+        ..setVolume(0)
+        ..play();
+      setState(() => _videoReady = true);
+    }).catchError((_) {
+      if (mounted) setState(() => _videoFailed = true);
+    });
+  }
+
+  void _disposeController() {
+    _controller?.dispose();
+    _controller = null;
+    _videoReady = false;
+    _videoFailed = false;
+  }
+
+  @override
+  void dispose() {
+    _disposeController();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Stack(fit: StackFit.expand, children: [
       // Background
       Container(decoration: BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topCenter, end: Alignment.bottomCenter,
-          colors: isMale
+          colors: widget.isMale
             ? [const Color(0xFF2D3A2D), const Color(0xFF1B2B1B)]
             : [const Color(0xFF3A2D2D), const Color(0xFF2B1B1B)],
         ),
       )),
-      // รูป Tutor จาก R2 (ถ้ามี)
-      if (photoUrl != null && photoUrl!.isNotEmpty)
+      // วิดีโอ AI Tutor (HeyGen) ถ้าโหลดสำเร็จ → รูปนิ่ง (R2) ถ้ายังไม่มีวิดีโอ/โหลดพัง → ไอคอนคน
+      if (_videoReady && _controller != null && !_videoFailed)
+        Positioned.fill(child: FittedBox(
+          fit: BoxFit.cover,
+          child: SizedBox(
+            width: _controller!.value.size.width,
+            height: _controller!.value.size.height,
+            child: VideoPlayer(_controller!),
+          ),
+        ))
+      else if (widget.photoUrl != null && widget.photoUrl!.isNotEmpty)
         Positioned.fill(child: CachedNetworkImage(
-          imageUrl: photoUrl!,
-          cacheKey: photoUrl,  // ใช้ URL เป็น key — เมื่อ URL เปลี่ยนจะโหลดใหม่
+          imageUrl: widget.photoUrl!,
+          cacheKey: widget.photoUrl,  // ใช้ URL เป็น key — เมื่อ URL เปลี่ยนจะโหลดใหม่
           fit: BoxFit.cover,
           placeholder: (_, __) => const SizedBox(),
           errorWidget: (_, __, ___) => _buildPersonIcon(),
@@ -1808,7 +2136,7 @@ class _TutorVideoPlaceholder extends StatelessWidget {
           decoration: BoxDecoration(
             color: Colors.black.withValues(alpha: 0.5),
             borderRadius: BorderRadius.circular(20)),
-          child: Text(name, style: const TextStyle(
+          child: Text(widget.name, style: const TextStyle(
             color: Colors.white, fontSize: 11, fontWeight: FontWeight.w600))))),
     ]);
   }
@@ -1817,21 +2145,67 @@ class _TutorVideoPlaceholder extends StatelessWidget {
     mainAxisSize: MainAxisSize.min, children: [
       Container(width: 70, height: 70,
         decoration: BoxDecoration(shape: BoxShape.circle,
-          color: isMale ? const Color(0xFFD4A574) : const Color(0xFFE8C5A0)),
+          color: widget.isMale ? const Color(0xFFD4A574) : const Color(0xFFE8C5A0)),
         child: const Icon(Icons.person, size: 48, color: Colors.white70)),
     ]));
 }
-class _MascotAvatar extends StatelessWidget {
-  const _MascotAvatar();
+// ─── Learner Panel ─────────────────────────────────────────────
+// แสดงกล้องจริงของผู้เรียน (ถ้าเปิด) หรือ Avatar ที่ผู้เรียนเลือกไว้ (ถ้าปิดกล้อง)
+class _LearnerPanel extends StatelessWidget {
+  final String name;
+  final bool cameraOn;
+  final CameraController? cameraController;
+  final String? avatarId;
+  final String? avatarUrl;
+
+  const _LearnerPanel({
+    required this.name,
+    required this.cameraOn,
+    required this.cameraController,
+    this.avatarId,
+    this.avatarUrl,
+  });
+
+  bool get _cameraReady =>
+      cameraOn && cameraController != null && cameraController!.value.isInitialized;
 
   @override
   Widget build(BuildContext context) {
-    return Column(mainAxisSize: MainAxisSize.min, children: [
-      Container(width: 90, height: 90,
-        decoration: const BoxDecoration(color: _kGreenLight, shape: BoxShape.circle),
-        child: const Center(child: Text('🎧', style: TextStyle(fontSize: 48)))),
-      const SizedBox(height: 8),
-      const Text('Avatar', style: TextStyle(color: Colors.white60, fontSize: 12)),
+    return Stack(fit: StackFit.expand, children: [
+      Container(color: const Color(0xFF2B1B1B)),
+      if (_cameraReady)
+        Positioned.fill(child: FittedBox(
+          fit: BoxFit.cover,
+          child: SizedBox(
+            width: cameraController!.value.previewSize?.height ?? 1,
+            height: cameraController!.value.previewSize?.width ?? 1,
+            // กล้องหน้า → กลับด้านซ้าย-ขวาให้เหมือนกระจก (ธรรมชาติสำหรับ selfie)
+            child: Transform(
+              alignment: Alignment.center,
+              transform: Matrix4.rotationY(math.pi),
+              child: CameraPreview(cameraController!),
+            ),
+          ),
+        ))
+      else if (avatarUrl != null && avatarUrl!.isNotEmpty)
+        Center(child: R2Avatar(
+          avatarId: avatarId, size: 84,
+          fallbackLetter: name.isNotEmpty ? name[0] : 'U',
+        ))
+      else
+        Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(width: 70, height: 70,
+            decoration: const BoxDecoration(shape: BoxShape.circle, color: Color(0xFFE8C5A0)),
+            child: const Icon(Icons.person, size: 48, color: Colors.white70)),
+        ])),
+      Positioned(bottom: 8, left: 0, right: 0,
+        child: Center(child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.5),
+            borderRadius: BorderRadius.circular(20)),
+          child: Text(name, style: const TextStyle(
+            color: Colors.white, fontSize: 11, fontWeight: FontWeight.w600))))),
     ]);
   }
 }
@@ -2039,6 +2413,139 @@ class _CompareSheet extends StatelessWidget {
           child: const Text('Close', style: TextStyle(fontSize: 16, color: Colors.white, fontWeight: FontWeight.w700)),
         )),
         const SizedBox(height: 8),
+      ]),
+    );
+  }
+}
+
+// ── Video Compare Sheet (วิดีโอผู้เรียน vs วิดีโอครู AI) ────────
+class _VideoCompareSheet extends StatefulWidget {
+  final String learnerVideoPath;
+  final String? tutorVideoUrl;
+  final String tutorName;
+  final int score;
+
+  const _VideoCompareSheet({
+    required this.learnerVideoPath,
+    required this.tutorVideoUrl,
+    required this.tutorName,
+    required this.score,
+  });
+
+  @override
+  State<_VideoCompareSheet> createState() => _VideoCompareSheetState();
+}
+
+class _VideoCompareSheetState extends State<_VideoCompareSheet> {
+  VideoPlayerController? _learnerCtrl;
+  VideoPlayerController? _tutorCtrl;
+  bool _ready = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _setup();
+  }
+
+  Future<void> _setup() async {
+    final futures = <Future>[];
+
+    _learnerCtrl = VideoPlayerController.file(File(widget.learnerVideoPath));
+    futures.add(_learnerCtrl!.initialize());
+
+    if (widget.tutorVideoUrl != null && widget.tutorVideoUrl!.isNotEmpty) {
+      _tutorCtrl = VideoPlayerController.networkUrl(Uri.parse(widget.tutorVideoUrl!));
+      futures.add(_tutorCtrl!.initialize());
+    }
+
+    try {
+      await Future.wait(futures);
+    } catch (_) {}
+    if (!mounted) return;
+    _learnerCtrl?.setLooping(true);
+    _tutorCtrl?.setLooping(true);
+    setState(() => _ready = true);
+  }
+
+  void _playBoth() {
+    _tutorCtrl?.seekTo(Duration.zero);
+    _learnerCtrl?.seekTo(Duration.zero);
+    _tutorCtrl?.play();
+    _learnerCtrl?.play();
+  }
+
+  void _pauseBoth() {
+    _tutorCtrl?.pause();
+    _learnerCtrl?.pause();
+  }
+
+  @override
+  void dispose() {
+    _learnerCtrl?.dispose();
+    _tutorCtrl?.dispose();
+    super.dispose();
+  }
+
+  Widget _videoBox(VideoPlayerController? c, String label, Color labelColor) {
+    return Expanded(child: Column(children: [
+      Text(label, style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: labelColor)),
+      const SizedBox(height: 6),
+      AspectRatio(
+        aspectRatio: 9 / 12,
+        child: Container(
+          decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(10)),
+          clipBehavior: Clip.antiAlias,
+          child: (c != null && c.value.isInitialized)
+              ? FittedBox(fit: BoxFit.cover, child: SizedBox(
+                  width: c.value.size.width, height: c.value.size.height, child: VideoPlayer(c)))
+              : const Center(child: Icon(Icons.videocam_off, color: Colors.white38)),
+        ),
+      ),
+    ]));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.all(20),
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Container(width: 40, height: 4,
+          decoration: BoxDecoration(color: _kBorder, borderRadius: BorderRadius.circular(2))),
+        const SizedBox(height: 16),
+        const Text('เปรียบเทียบวิดีโอ', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
+        const SizedBox(height: 16),
+        if (!_ready)
+          const Padding(padding: EdgeInsets.symmetric(vertical: 40),
+            child: CircularProgressIndicator(color: _kGreen))
+        else
+          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            _videoBox(_tutorCtrl, widget.tutorName, _kGreen),
+            const SizedBox(width: 12),
+            _videoBox(_learnerCtrl, 'คุณ', _kRed),
+          ]),
+        const SizedBox(height: 12),
+        if (_ready)
+          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            IconButton(onPressed: _playBoth, icon: const Icon(Icons.play_arrow, color: _kGreen, size: 32)),
+            IconButton(onPressed: _pauseBoth, icon: const Icon(Icons.pause, color: _kSub, size: 32)),
+          ]),
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(color: _kGreenLight, borderRadius: BorderRadius.circular(12)),
+          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            const Text('คะแนนการออกเสียง: ', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+            Text('${widget.score}%', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: _kGreen)),
+          ]),
+        ),
+        const SizedBox(height: 12),
+        SizedBox(width: double.infinity, height: 48, child: ElevatedButton(
+          onPressed: () => Navigator.pop(context),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: _kGreen,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
+          child: const Text('ปิด', style: TextStyle(fontSize: 16, color: Colors.white, fontWeight: FontWeight.w700)),
+        )),
+        const SizedBox(height: 4),
       ]),
     );
   }

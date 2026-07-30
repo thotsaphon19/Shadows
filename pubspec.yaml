@@ -21,6 +21,8 @@ dependencies:
   flutter_sound:        ^9.2.13
   flutter_tts:          3.8.5
   video_player:         ^2.8.2
+  camera:               ^0.10.5+9
+  ffmpeg_kit_flutter_new: ^4.2.0
 
   # Speech Recognition
   speech_to_text:       ^7.0.0
