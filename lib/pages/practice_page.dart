@@ -19,7 +19,6 @@
 // ============================================================
 
 import 'dart:async';
-import 'dart:async' show StreamSubscription;
 import 'dart:math' as math;
 import 'dart:io';
 import 'package:flutter/material.dart';
@@ -36,8 +35,6 @@ import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:http/http.dart' as http;
-import '../theme/app_theme.dart';
-import '../widgets/shared_widgets.dart';
 import '../services/tts_service.dart';
 import '../services/pronunciation_scoring_service.dart';
 import '../services/cloudflare_r2_service.dart';
@@ -113,7 +110,6 @@ class _PracticePageState extends State<PracticePage>
 
   // ── Data ──
   final _recorder = FlutterSoundRecorder();
-  PronunciationResult? _lastResult;
   StreamSubscription? _recSub;
   Map<String, dynamic> _tutor = {};
   Map<String, dynamic> _lesson = {};
@@ -562,7 +558,7 @@ class _PracticePageState extends State<PracticePage>
       confidence:     PronunciationScoringService.lastConfidence,
     );
 
-    setState(() { _pronunciationScore = result.overallScore; _lastResult = result; });
+    setState(() { _pronunciationScore = result.overallScore; });
     _scoreController.forward(from: 0);
 
     // บันทึกลง Firestore + อัปโหลดเสียง

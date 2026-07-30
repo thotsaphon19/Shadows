@@ -33,7 +33,7 @@ class _HomePageState extends State<HomePage> {
   ];
 
   @override
-  void initState() { super.initState(); _load(); }
+  void initState() { super.initState(); _load(); _initServices(); }
 
   Future<void> _initServices() async {
     // ล้าง image cache และโหลดใหม่จาก Firestore
