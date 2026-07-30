@@ -125,13 +125,13 @@ class PronunciationScoringService {
         recognized = result.recognizedWords;
         confidence = result.confidence;
       },
-      localeId: languageCode,
       listenOptions: SpeechListenOptions(
         partialResults: false,
         cancelOnError:  false,
         listenMode:     ListenMode.confirmation,
         listenFor:      maxDuration,
         pauseFor:       const Duration(seconds: 3),
+        localeId:       languageCode,
       ),
     );
 
@@ -303,13 +303,13 @@ class PronunciationScoringService {
         _lastConfidence = result.confidence > 0 ? result.confidence : 0.8;
         onResult(_lastRecognized, _lastConfidence);
       },
-      localeId: languageCode,
       listenOptions: SpeechListenOptions(
         partialResults: true,
         cancelOnError:  false,
         listenMode:     ListenMode.confirmation,
         listenFor:      maxDuration,
         pauseFor:       const Duration(seconds: 3),
+        localeId:       languageCode,
       ),
     );
   }
