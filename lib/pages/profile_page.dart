@@ -231,6 +231,7 @@ class _ProfilePageState extends State<ProfilePage> {
                     _row(Icons.logout, 'Log Out', onTap: () async {
                       await FirebaseAuth.instance.signOut();
                       if (!mounted) return;
+                      // ignore: use_build_context_synchronously
                       Navigator.pushReplacementNamed(context, '/login');
                     }),
                     _row(Icons.delete_outline, 'Delete Account', isDanger: true, onTap: _deleteAccount),

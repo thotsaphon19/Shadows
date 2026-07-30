@@ -631,7 +631,7 @@ class _PracticePageState extends State<PracticePage>
       );
       if (mounted) {
         setState(() {
-          _recordings = [newItem, ..._recordings.where((r) => r.isCompleted || !r.isCompleted).toList()];
+          _recordings = [newItem, ..._recordings.where((r) => r.isCompleted || !r.isCompleted)];
         });
       }
       await _loadData();
@@ -1550,26 +1550,38 @@ class _PracticePageState extends State<PracticePage>
           _ShareIcon(brand: _ShareBrand.tiktok, label: 'TikTok/Reels',
             onTap: () {
               final completed = _recordings.where((r) => r.isCompleted).toList();
-              if (completed.isNotEmpty) _shareRecording(completed.last);
-              else Share.share('ฝึกภาษากับ Shadows by yannawut! 🎧 #ShadowsApp');
+              if (completed.isNotEmpty) {
+                _shareRecording(completed.last);
+              } else {
+                Share.share('ฝึกภาษากับ Shadows by yannawut! 🎧 #ShadowsApp');
+              }
             }),
           _ShareIcon(brand: _ShareBrand.youtube, label: 'YouTube',
             onTap: () {
               final completed = _recordings.where((r) => r.isCompleted).toList();
-              if (completed.isNotEmpty) _shareRecording(completed.last);
-              else Share.share('ฝึกภาษากับ Shadows by yannawut! 🎧 #ShadowsApp');
+              if (completed.isNotEmpty) {
+                _shareRecording(completed.last);
+              } else {
+                Share.share('ฝึกภาษากับ Shadows by yannawut! 🎧 #ShadowsApp');
+              }
             }),
           _ShareIcon(brand: _ShareBrand.facebook, label: 'Facebook',
             onTap: () {
               final completed = _recordings.where((r) => r.isCompleted).toList();
-              if (completed.isNotEmpty) _shareRecording(completed.last);
-              else Share.share('ฝึกภาษากับ Shadows by yannawut! 🎧 #ShadowsApp');
+              if (completed.isNotEmpty) {
+                _shareRecording(completed.last);
+              } else {
+                Share.share('ฝึกภาษากับ Shadows by yannawut! 🎧 #ShadowsApp');
+              }
             }),
           _ShareIcon(brand: _ShareBrand.line, label: 'LINE',
             onTap: () {
               final completed = _recordings.where((r) => r.isCompleted).toList();
-              if (completed.isNotEmpty) _shareRecording(completed.last);
-              else Share.share('ฝึกภาษากับ Shadows by yannawut! 🎧 #ShadowsApp');
+              if (completed.isNotEmpty) {
+                _shareRecording(completed.last);
+              } else {
+                Share.share('ฝึกภาษากับ Shadows by yannawut! 🎧 #ShadowsApp');
+              }
             }),
         ],
       ),

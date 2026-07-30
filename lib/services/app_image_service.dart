@@ -9,7 +9,7 @@ import 'package:cached_network_image/cached_network_image.dart';
 class AppImageService {
   static Map<String, String> _urls = {};
   static bool   _loaded  = false;
-  static String _version = '';
+  static final String _version = '';
 
   // ── โหลด URLs จาก Firestore ──────────────────────────────
   static Future<void> init() async {

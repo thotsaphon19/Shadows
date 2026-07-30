@@ -39,6 +39,7 @@ class _PremiumPageState extends State<PremiumPage> {
           Future.delayed(const Duration(seconds: 2), () {
             if (mounted) {
               setState(() => _loading = false);
+              // ignore: use_build_context_synchronously
               ScaffoldMessenger.of(context).showSnackBar(
                 const SnackBar(content: Text('กำลังเปิด Payment... (RevenueCat integration needed)')));
             }

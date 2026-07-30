@@ -8,7 +8,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 
 class R2Service {
-  static Map<String,String> _avatarUrls = {};
+  static final Map<String,String> _avatarUrls = {};
   static Map<String,String> _imageUrls  = {};
   static bool _loaded = false;
 

@@ -213,7 +213,7 @@ class _LeaderboardPageState extends State<LeaderboardPage> {
         style: TextStyle(fontSize: 13, color: AppColors.primaryMid, fontFamily: 'NotoSans')),
       const SizedBox(height: 12),
       Row(children: [
-        _statPill('👥', _totalUsers > 0 ? '${_totalUsers}' : '0', 'Total Learners'),
+        _statPill('👥', _totalUsers > 0 ? '$_totalUsers' : '0', 'Total Learners'),
         const SizedBox(width: 8),
         _statPill('⏰', _totalHours > 0 ? '${_totalHours.round()}h' : '--', 'Total Hours'),
         const SizedBox(width: 8),
